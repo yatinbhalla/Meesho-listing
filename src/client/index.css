@@ -1,0 +1,8 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom scrollbar for the live log panel */
+.log-panel::-webkit-scrollbar { width: 6px; }
+.log-panel::-webkit-scrollbar-track { background: #1e1e2e; }
+.log-panel::-webkit-scrollbar-thumb { background: #f43397; border-radius: 3px; }

@@ -1,0 +1,148 @@
+import express from 'express';
+import fs from 'fs/promises';
+import path from 'path';
+import multer from 'multer';
+
+const router = express.Router();
+const PATHS_DIR = path.resolve('paths');
+
+async function ensurePathsDir() {
+  await fs.mkdir(PATHS_DIR, { recursive: true });
+}
+
+// Helper: resolve a path's config.json by directory name (= safeName).
+async function loadConfig(name) {
+  const file = path.join(PATHS_DIR, name, 'config.json');
+  const raw = await fs.readFile(file, 'utf8');
+  return { config: JSON.parse(raw), file };
+}
+
+// ─── GET /api/paths — list all saved paths ────────────────────────────────────
+router.get('/', async (_req, res) => {
+  await ensurePathsDir();
+  const entries = await fs.readdir(PATHS_DIR, { withFileTypes: true });
+  const configs = [];
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue;
+    try {
+      const raw = await fs.readFile(path.join(PATHS_DIR, entry.name, 'config.json'), 'utf8');
+      const config = JSON.parse(raw);
+      // Tag with the folder name so the UI can use it for subsequent calls.
+      config._folder = entry.name;
+      // Mark whether shared images are uploaded — UI shows a warning if not.
+      config._sharedImagesReady = await sharedImagesPresent(entry.name);
+      configs.push(config);
+    } catch {
+      // Skip incomplete dirs
+    }
+  }
+  res.json(configs);
+});
+
+// ─── GET /api/paths/:name — fetch one path ────────────────────────────────────
+router.get('/:name', async (req, res) => {
+  try {
+    const { config } = await loadConfig(req.params.name);
+    config._folder = req.params.name;
+    config._sharedImagesReady = await sharedImagesPresent(req.params.name);
+    res.json(config);
+  } catch {
+    res.status(404).json({ error: 'Path not found.' });
+  }
+});
+
+// ─── PATCH /api/paths/:name — update fields/metadata after recording ──────────
+// Used to mark which fields are AI-generated, fixed, or SKU.
+router.patch('/:name', async (req, res) => {
+  try {
+    const { config, file } = await loadConfig(req.params.name);
+
+    // Whitelist of editable top-level keys.
+    const editable = ['name', 'skuPattern', 'productDescription', 'fields'];
+    for (const key of editable) {
+      if (key in req.body) config[key] = req.body[key];
+    }
+    config.updatedAt = new Date().toISOString();
+
+    await fs.writeFile(file, JSON.stringify(config, null, 2), 'utf8');
+    res.json(config);
+  } catch (err) {
+    res.status(500).json({ error: `Failed to update path: ${err.message}` });
+  }
+});
+
+// ─── DELETE /api/paths/:name ──────────────────────────────────────────────────
+router.delete('/:name', async (req, res) => {
+  try {
+    await fs.rm(path.join(PATHS_DIR, req.params.name), { recursive: true, force: true });
+    res.json({ ok: true });
+  } catch {
+    res.status(500).json({ error: 'Could not delete path.' });
+  }
+});
+
+// ─── POST /api/paths/:name/images — upload 3 shared images ────────────────────
+// WHY: shared images are stored as img2.jpg / img3.jpg / img4.jpg regardless
+// of the original filename, so the executor can predict the path at run time.
+const sharedUpload = multer({
+  storage: multer.diskStorage({
+    destination: async (req, _file, cb) => {
+      const dir = path.join(PATHS_DIR, req.params.name, 'shared_images');
+      await fs.mkdir(dir, { recursive: true });
+      cb(null, dir);
+    },
+    filename: (_req, file, cb) => cb(null, `__tmp_${Date.now()}_${file.originalname}`),
+  }),
+  limits: { fileSize: 10 * 1024 * 1024 },
+  fileFilter: (_req, file, cb) => {
+    /jpeg|jpg|png|webp/i.test(path.extname(file.originalname))
+      ? cb(null, true)
+      : cb(new Error('Only JPG, PNG, and WebP images allowed.'));
+  },
+});
+
+router.post(
+  '/:name/images',
+  sharedUpload.fields([
+    { name: 'img2', maxCount: 1 },
+    { name: 'img3', maxCount: 1 },
+    { name: 'img4', maxCount: 1 },
+  ]),
+  async (req, res) => {
+    try {
+      const dir = path.join(PATHS_DIR, req.params.name, 'shared_images');
+      const required = ['img2', 'img3', 'img4'];
+      for (const slot of required) {
+        if (!req.files?.[slot]?.[0]) {
+          return res.status(400).json({ error: `Missing image: ${slot}` });
+        }
+      }
+
+      // Rename the uploaded tmp files into stable slot names, overwriting any
+      // previous shared images for this path.
+      for (const slot of required) {
+        const tmpPath = req.files[slot][0].path;
+        const finalPath = path.join(dir, `${slot}.jpg`);
+        await fs.rm(finalPath, { force: true });
+        await fs.rename(tmpPath, finalPath);
+      }
+
+      res.json({ ok: true });
+    } catch (err) {
+      res.status(500).json({ error: `Upload failed: ${err.message}` });
+    }
+  }
+);
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+async function sharedImagesPresent(name) {
+  const dir = path.join(PATHS_DIR, name, 'shared_images');
+  try {
+    const files = await fs.readdir(dir);
+    return ['img2.jpg', 'img3.jpg', 'img4.jpg'].every((f) => files.includes(f));
+  } catch {
+    return false;
+  }
+}
+
+export default router;

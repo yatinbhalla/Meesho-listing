@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Mock Listing Form</title>
+  <style>
+    body { font-family: sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; }
+    label { display: block; margin-top: 12px; font-weight: bold; }
+    input, textarea, select { width: 100%; padding: 8px; box-sizing: border-box; margin-top: 4px; }
+    button { margin-top: 16px; padding: 12px 24px; background: #f43397; color: #fff; border: none; cursor: pointer; }
+    .out { margin-top: 20px; background: #eee; padding: 10px; white-space: pre-wrap; font-family: monospace; }
+  </style>
+</head>
+<body>
+  <h1>Mock Listing Form</h1>
+  <p>Used for smoke-testing the executor without touching Meesho.</p>
+
+  <form id="form">
+    <label for="title">Product Title</label>
+    <input id="title" name="title" />
+
+    <label for="sku">SKU</label>
+    <input id="sku" name="sku" />
+
+    <label for="description">Description</label>
+    <textarea id="description" name="description" rows="3"></textarea>
+
+    <label for="category">Category</label>
+    <select id="category" name="category">
+      <option value="">— Select —</option>
+      <option value="cushion">Cushion Cover</option>
+      <option value="curtain">Curtain</option>
+      <option value="blanket">Blanket</option>
+    </select>
+
+    <label for="hero">Hero Image</label>
+    <input id="hero" type="file" accept="image/*" />
+
+    <label for="img2">Image 2</label>
+    <input id="img2" type="file" accept="image/*" />
+
+    <button type="button" id="submit">Submit Listing</button>
+  </form>
+
+  <div id="output" class="out" hidden></div>
+
+  <script>
+    document.getElementById('submit').addEventListener('click', () => {
+      const data = {
+        title:       document.getElementById('title').value,
+        sku:         document.getElementById('sku').value,
+        description: document.getElementById('description').value,
+        category:    document.getElementById('category').value,
+        hero:        document.getElementById('hero').files[0]?.name || null,
+        img2:        document.getElementById('img2').files[0]?.name || null,
+      };
+      const out = document.getElementById('output');
+      out.hidden = false;
+      out.textContent = '✅ Submitted!\n\n' + JSON.stringify(data, null, 2);
+    });
+  </script>
+</body>
+</html>

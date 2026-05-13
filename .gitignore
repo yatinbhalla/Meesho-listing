@@ -1,0 +1,35 @@
+# ─── SECURITY — never commit these ─────────────────────────────────────────────
+.env
+.env.local
+data/cookies.json
+data/.browser-profile/
+data/uploads/
+
+# ─── Private business data ─────────────────────────────────────────────────────
+# Recorded paths contain product descriptions, manufacturer details, MRPs etc.
+# Used SKUs reveal listing volume. Both stay local.
+paths/*
+!paths/.gitkeep
+data/used_skus.json
+
+# ─── Dependencies ───────────────────────────────────────────────────────────────
+node_modules/
+
+# ─── Build output ───────────────────────────────────────────────────────────────
+dist/
+
+# ─── OS noise ───────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ─── Playwright browser cache ───────────────────────────────────────────────────
+playwright-report/
+test-results/
+
+# ─── Editor noise ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+
+# ─── Claude Code local config ──────────────────────────────────────────────────
+.claude/
