@@ -50,7 +50,11 @@ export function executeRun({ pathConfig, heroImagePath, pathDir, aiValues = {}, 
     const activePage = page || (await getSession((m) => log('info', m))).page;
 
     // imageSlot resets on every call — first image filled is always the hero.
-    const ctx = { page: activePage, pathConfig, pathDir, heroImagePath, aiValues, sku, log, imageSlot: 0 };
+    // imageFieldCount lets fillField decide whether a non-hero image input is
+    // the single "Add more" multi-file input (→ upload all shared images at
+    // once) or one of several discrete slots (→ one image each).
+    const imageFieldCount = (pathConfig.fields || []).filter((f) => f.type === 'image').length;
+    const ctx = { page: activePage, pathConfig, pathDir, heroImagePath, aiValues, sku, log, imageSlot: 0, imageFieldCount };
 
     // Tracks whether the steps we're about to replay are part of the recorded
     // login flow. When the persistent profile is already logged in, the browser
@@ -179,7 +183,11 @@ async function runStepWithRetry(step, stepIndex, ctx) {
       log: ctx.log,
     });
 
-    if (aiResult?.selector) {
+    // Guard: if AI returns the exact selector that just failed, retrying it is
+    // pointless (it'll fail identically). Skip straight to manual recovery.
+    if (aiResult?.selector && aiResult.selector === step.selector) {
+      ctx.log('info', '🤖 AI suggested the same selector that just failed — going to manual recovery.');
+    } else if (aiResult?.selector) {
       ctx.log('success', `🤖 ✓ AI suggested: ${aiResult.selector}${aiResult.reason ? ` — ${aiResult.reason}` : ''}`);
       const aiSelector = aiResult.selector;
 
@@ -232,7 +240,17 @@ async function executeStep(step, ctx) {
     return;
   }
   if (step.action === 'click') {
-    await smartClick(page, step.selector);
+    // Skip clicks on file inputs — they're usually hidden behind a styled
+    // button, so clicking fails ("element not visible"). The upload is handled
+    // by the subsequent fill step (setInputFiles works on hidden inputs).
+    const isFileInput = await page.locator(step.selector).first()
+      .evaluate((el) => el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'file')
+      .catch(() => false);
+    if (isFileInput) {
+      ctx.log('info', `↪ ${step.label}: file input — upload handled by the fill step, skipping click.`);
+      return;
+    }
+    await smartClick(page, step.selector, step.label);
     return;
   }
   if (step.action === 'select') {
@@ -289,17 +307,20 @@ async function waitForReady(page, step, log) {
 }
 
 /**
- * Click that survives Meesho's floating-label / fieldset wrappers AND
- * delayed renders. Three-layer fallback:
+ * Click that survives Meesho's floating-label wrappers, React-Select dropdown
+ * options, and delayed renders. Fallback ladder:
  *
  *   1. Normal click (Playwright auto-waits for visible/stable/no-overlay).
  *   2. If overlay is intercepting → scroll into view, then force-click.
- *      Force bypasses actionability — browser routes the click to whatever
- *      element is on top at those coordinates (usually the input the user
- *      actually meant).
- *   3. If element wasn't ready in time → wait, scroll, then force-click.
+ *   3. If element wasn't found in time → try matching an OPEN dropdown option
+ *      by its visible text/role (most Meesho fields are React-Select dropdowns,
+ *      whose option DOM is positional and brittle but whose accessible name is
+ *      stable). Then fall back to wait + force-click.
+ *
+ * @param {string} [label] - the recorded step label (option text), used for the
+ *   role/text-based dropdown-option fallback.
  */
-async function smartClick(page, selector) {
+async function smartClick(page, selector, label = '') {
   const locator = page.locator(selector).first();
 
   try {
@@ -315,10 +336,13 @@ async function smartClick(page, selector) {
       return;
     }
 
-    // Timeout / element-not-yet-rendered case — give the page another
-    // chance, scroll into view, then force-click.
+    // Element not found in time — likely a React-Select option whose recorded
+    // positional selector no longer matches. Try selecting by accessible
+    // name / visible text within the currently-open dropdown.
     if (/Timeout|waiting for/i.test(msg)) {
-      await page.waitForTimeout(2000);
+      if (await clickOptionByText(page, label)) return;
+
+      await page.waitForTimeout(1500);
       try { await locator.scrollIntoViewIfNeeded({ timeout: 2000 }); } catch {}
       await locator.click({ timeout: 5000, force: true });
       return;
@@ -328,15 +352,69 @@ async function smartClick(page, selector) {
   }
 }
 
+/**
+ * Click a visible dropdown option by its text. Tries, in order:
+ *   role=option (exact) → role=option (substring) → listitem → any exact-text node.
+ * Returns true if a visible match was clicked. Used to make React-Select option
+ * selection robust against brittle positional selectors — no AI call needed.
+ */
+async function clickOptionByText(page, label) {
+  const text = String(label || '').replace(/\s+/g, ' ').trim();
+  if (!text || text.length > 60) return false;
+
+  const candidates = [
+    page.getByRole('option', { name: text, exact: true }),
+    page.getByRole('option', { name: text }),
+    page.getByRole('menuitemradio', { name: text, exact: true }),
+    page.locator('[role="option"]', { hasText: text }),
+    page.locator('li', { hasText: text }),
+  ];
+
+  for (const c of candidates) {
+    const first = c.first();
+    if (await first.isVisible({ timeout: 1000 }).catch(() => false)) {
+      try {
+        await first.scrollIntoViewIfNeeded({ timeout: 1000 });
+        await first.click({ timeout: 3000 });
+        return true;
+      } catch { /* try next candidate */ }
+    }
+  }
+  return false;
+}
+
 async function fillField(page, field, ctx) {
   const { heroImagePath, pathDir, aiValues, sku, imageSlot, log } = ctx;
 
   if (field.type === 'image') {
-    const file = imageSlot === 0
-      ? heroImagePath
-      : path.join(pathDir, 'shared_images', `img${imageSlot + 1}.jpg`);
-    log('info', `🖼  Uploading image #${imageSlot + 1}: ${path.basename(file)}`);
-    await page.setInputFiles(field.selector, file);
+    const sharedDir = path.join(pathDir, 'shared_images');
+    const sharedFiles = ['img2.jpg', 'img3.jpg', 'img4.jpg'].map((f) => path.join(sharedDir, f));
+
+    if (imageSlot === 0) {
+      // Hero — the unique per-listing photo.
+      log('info', `🖼  Uploading hero image: ${path.basename(heroImagePath)}`);
+      await page.setInputFiles(field.selector, heroImagePath);
+      return;
+    }
+
+    // Non-hero image input. Meesho's "Add more images" input accepts MULTIPLE
+    // files at once. If the path has only one extra image input (the common
+    // case: hero + "add more"), push ALL shared images to it in a single
+    // setInputFiles call — otherwise only img2 would ever upload.
+    if (ctx.imageFieldCount <= 2) {
+      const present = [];
+      for (const f of sharedFiles) {
+        try { await fs.access(f); present.push(f); } catch { /* skip missing */ }
+      }
+      const files = present.length ? present : sharedFiles;
+      log('info', `🖼  Uploading ${files.length} shared image(s): ${files.map((f) => path.basename(f)).join(', ')}`);
+      await page.setInputFiles(field.selector, files);
+    } else {
+      // Multiple discrete image slots — one shared image per slot.
+      const file = path.join(sharedDir, `img${imageSlot + 1}.jpg`);
+      log('info', `🖼  Uploading image #${imageSlot + 1}: ${path.basename(file)}`);
+      await page.setInputFiles(field.selector, file);
+    }
     return;
   }
 
@@ -353,8 +431,24 @@ async function fillField(page, field, ctx) {
     log('info', `📝 ${field.fieldName}: ${truncate(value, 60)}`);
   }
 
-  await page.fill(field.selector, '').catch(() => {});
-  await page.fill(field.selector, value);
+  const loc = page.locator(field.selector).first();
+
+  // WHY: Meesho's GST %, HSN code, and similar fields are React-Select style
+  // dropdowns. Their underlying <input> (#supplier_gst_percent, #hsn_code) is
+  // HIDDEN and managed by React — the value is set by the preceding click steps
+  // (open dropdown → click option), not by typing. page.fill() on a hidden input
+  // hangs for the full timeout and then fails. So: if the target isn't actually
+  // editable, the value was already set by the dropdown selection — skip the
+  // redundant fill instead of hanging/aborting.
+  const editable = await loc.isEditable({ timeout: 5000 }).catch(() => false);
+  if (!editable) {
+    log('info', `↪ ${field.fieldName}: not a typeable input (dropdown-managed) — value already set by selection, skipping fill.`);
+    return;
+  }
+
+  // Editable text input — fill normally with a bounded timeout (not the 30s default).
+  await loc.fill('', { timeout: 8000 }).catch(() => {});
+  await loc.fill(value, { timeout: 8000 });
 }
 
 // How long the recovery overlay waits for the user before giving up.

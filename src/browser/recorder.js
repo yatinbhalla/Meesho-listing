@@ -32,7 +32,7 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
     handleEvent(event);
   });
 
-  await context.exposeFunction('__recorderFinish', (config) => resolveFinish(config));
+  await context.exposeFunction('__recorderFinish', () => resolveFinish());
 
   await context.exposeFunction('__recorderPauseToggle', (paused) => {
     state.paused = paused;
@@ -133,14 +133,38 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
       // --- Visible-text strategies (Playwright text engine) ---------------
       // Use innerText (not textContent) so we capture only what the user sees.
       const rawText = (el.innerText || '').replace(/\s+/g, ' ').trim();
-      const usable = rawText && rawText.length >= 2 && rawText.length <= 80
-        && /[A-Za-z]/.test(rawText)               // must contain letters (not just numbers)
-        && !/^[\s​-‍﻿]+$/.test(rawText);  // not just whitespace/zero-width
 
-      // 5. Role + accessible name (Playwright's `role` locator).
+      // Is this a selectable OPTION (dropdown / MUI menu item / listbox row)?
+      // WHY: Meesho's measurement dropdowns (length/width/weight) have purely
+      // NUMERIC options ("0.5", "5", "30"). We MUST anchor on their exact text,
+      // otherwise we fall through to a generic class like `li.MuiMenuItem-root`
+      // which matches the FIRST option in EVERY dropdown — silently selecting
+      // the wrong value with no error. So for option-like elements we allow
+      // numeric text and use an exact text match.
+      const optionLike =
+        el.getAttribute('role') === 'option' ||
+        el.getAttribute('role') === 'menuitem' ||
+        el.getAttribute('role') === 'menuitemradio' ||
+        tag === 'option' ||
+        /\bMenuItem\b|\boption\b/i.test(el.className || '');
+
+      const hasLetters = /[A-Za-z]/.test(rawText);
+      const notBlank = rawText && !/^[\s​-‍﻿]+$/.test(rawText);
+      // Generic elements need letters (avoid matching stray numbers); option-like
+      // elements may be purely numeric.
+      const usable = notBlank && rawText.length <= 80 &&
+        (optionLike ? rawText.length >= 1 : (rawText.length >= 2 && hasLetters));
+
       const role = el.getAttribute('role') || implicitRole(el);
-      if (role && usable) {
-        // Escape quotes inside text for the locator string.
+
+      // 5a. Option-like → EXACT text match (Playwright `text="..."` is exact).
+      //     This is the single most important selector for Meesho's dropdowns.
+      if (optionLike && usable) {
+        return `text="${rawText.replace(/"/g, '\\"')}"`;
+      }
+
+      // 5b. Role + accessible name (Playwright's `role` locator) for others.
+      if (role && usable && hasLetters) {
         const safe = rawText.replace(/"/g, '\\"');
         return `role=${role}[name="${safe}"]`;
       }
@@ -215,10 +239,19 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
     const isInsideOverlay = (el) => !!el.closest && !!el.closest('#__meesho_recorder_panel');
 
     // ── Click capture (for steps) ──────────────────────────────────────────
-    // Walk to the nearest SEMANTIC ancestor — buttons, links, list options, etc.
-    // Avoid capturing opaque wrapper divs that have no identity. If nothing
-    // semantic is in scope, fall back to the click target itself.
-    const SEMANTIC_TAGS = 'button, a, [role="button"], [role="option"], [role="tab"], [role="menuitem"], [role="checkbox"], [role="radio"], [role="link"], label, li, option, input[type="checkbox"], input[type="radio"]';
+    // Walk to the nearest SEMANTIC ancestor — buttons, links, list options,
+    // checkboxes, radios, switches (incl. MUI's styled-span variants). Avoid
+    // capturing opaque wrapper divs that have no identity. If nothing semantic
+    // is in scope, fall back to the click target itself.
+    const SEMANTIC_TAGS = 'button, a, [role="button"], [role="option"], [role="tab"], ' +
+      '[role="menuitem"], [role="menuitemradio"], [role="checkbox"], [role="radio"], [role="switch"], ' +
+      '[role="link"], label, li, option, input[type="checkbox"], input[type="radio"], ' +
+      '.MuiCheckbox-root, .MuiRadio-root, .MuiSwitch-root, .MuiMenuItem-root';
+
+    // Elements that ARE controls even when they have no visible text
+    // (MUI checkboxes/switches/radios are just styled spans + a hidden input).
+    const CONTROL_SELECTOR = 'button, a, [role], input, select, textarea, label, li, option, ' +
+      '.MuiCheckbox-root, .MuiRadio-root, .MuiSwitch-root, .MuiMenuItem-root';
 
     function findClickTarget(el) {
       if (!el) return null;
@@ -226,22 +259,27 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
       return semantic || el;
     }
 
+    function isFileInput(el) {
+      return el && el.tagName === 'INPUT' && (el.getAttribute('type') || '').toLowerCase() === 'file';
+    }
+
     function isMeaningfulClick(el) {
       if (!el) return false;
-      // Skip clicks on the document root or layout containers with no identity.
       if (el === document.body || el === document.documentElement) return false;
-      // Skip elements whose visible text is only zero-width characters.
+      // Skip clicks directly on hidden file inputs — the file is set via the
+      // upload (change) event, not a click. Recording the click just produces
+      // a step that fails at replay ("element not visible").
+      if (isFileInput(el)) return false;
       const text = (el.innerText || '').replace(/[\s​-‍﻿]+/g, '').trim();
       const hasText = text.length > 0;
+      const isControl = el.matches && el.matches(CONTROL_SELECTOR);
       const hasIdentity =
-        el.id ||
-        el.getAttribute('name') ||
-        el.getAttribute('data-testid') ||
-        el.getAttribute('aria-label') ||
-        el.getAttribute('role') ||
+        el.id || el.getAttribute('name') || el.getAttribute('data-testid') ||
+        el.getAttribute('aria-label') || el.getAttribute('role') ||
         ['BUTTON', 'A', 'LI', 'OPTION', 'INPUT', 'SELECT', 'TEXTAREA', 'LABEL'].includes(el.tagName);
-      // Need either visible text OR a semantic identity to be worth capturing.
-      return hasText || hasIdentity;
+      // Capture if it has text, a semantic identity, OR is a known control
+      // (covers text-less MUI checkboxes/switches the user toggled).
+      return hasText || hasIdentity || isControl;
     }
 
     document.addEventListener('click', (e) => {
@@ -335,7 +373,15 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
         window.__recorderClear();
       });
 
-      document.getElementById('__rec_finish').addEventListener('click', showConfigForm);
+      // Finish recording. Path details (name, SKU, description) are collected
+      // in the app's PathConfig screen — NOT here — because Meesho's page modals
+      // use focus-traps that make injected overlay inputs un-typeable.
+      document.getElementById('__rec_finish').addEventListener('click', () => {
+        window.__recorderFinish();
+        panel.innerHTML =
+          '<div style="text-align:center;padding:24px;color:#4ade80;font-weight:bold;">✅ Recording saved!<br/>' +
+          '<span style="font-size:11px;color:#aaa;font-weight:normal;">Switch back to the Meesho Lister app to name &amp; configure this path.</span></div>';
+      });
 
       // Hook into emit so we can reflect events in the UI list
       const originalEmit = window.__recorderEmit;
@@ -357,38 +403,6 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
       };
     }
 
-    function showConfigForm() {
-      const panel = document.getElementById('__meesho_recorder_panel');
-      if (!panel) return;
-      panel.innerHTML = `
-        <strong style="color:#f43397;display:block;margin-bottom:12px;font-size:14px;">⚙️ Configure Path</strong>
-        <label style="display:block;margin-bottom:4px;font-size:11px;color:#aaa;">Path Name</label>
-        <input id="__cfg_name" placeholder="Faux Fur Cushion Cover"
-          style="width:100%;padding:8px;background:#0f0f1a;border:1px solid #333;color:#fff;border-radius:4px;margin-bottom:10px;box-sizing:border-box;" />
-        <label style="display:block;margin-bottom:4px;font-size:11px;color:#aaa;">SKU Pattern (X = random number)</label>
-        <input id="__cfg_sku" placeholder="WH_FURR/X"
-          style="width:100%;padding:8px;background:#0f0f1a;border:1px solid #333;color:#fff;border-radius:4px;margin-bottom:10px;box-sizing:border-box;" />
-        <label style="display:block;margin-bottom:4px;font-size:11px;color:#aaa;">Product Description (used by AI)</label>
-        <textarea id="__cfg_desc" rows="3" placeholder="White faux fur cushion cover, 16x16 inch, soft texture, for sofa"
-          style="width:100%;padding:8px;background:#0f0f1a;border:1px solid #333;color:#fff;border-radius:4px;margin-bottom:10px;box-sizing:border-box;font-family:inherit;resize:vertical;"></textarea>
-        <p style="font-size:11px;color:#888;margin:0 0 10px;">After saving, mark which fields are AI-generated in the Meesho Lister app.</p>
-        <button id="__cfg_save" style="width:100%;padding:10px;background:#f43397;color:#fff;border:none;border-radius:6px;font-weight:bold;cursor:pointer;">Save Path</button>
-      `;
-
-      document.getElementById('__cfg_save').addEventListener('click', () => {
-        const name = document.getElementById('__cfg_name').value.trim();
-        const skuPattern = document.getElementById('__cfg_sku').value.trim();
-        const productDescription = document.getElementById('__cfg_desc').value.trim();
-        if (!name) { alert('Please enter a path name.'); return; }
-        if (!skuPattern || !skuPattern.includes('X')) {
-          alert('SKU pattern must include an X (it gets replaced with a random number).');
-          return;
-        }
-        window.__recorderFinish({ name, skuPattern, productDescription });
-        panel.innerHTML = '<div style="text-align:center;padding:24px;color:#0f0;">✅ Saved!<br/><span style="font-size:11px;color:#aaa;">You can close this browser window.</span></div>';
-      });
-    }
-
     if (document.readyState === 'loading') {
       document.addEventListener('DOMContentLoaded', injectPanel);
     } else {
@@ -399,23 +413,30 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
   // ─── Wait for user to finish ────────────────────────────────────────────────
   log('Recording started. Walk through Meesho\'s listing form, then click "Save & Finish".');
 
-  const userConfig = await finishPromise;
+  await finishPromise;
 
   // ─── Assemble + persist PathConfig ──────────────────────────────────────────
+  // Path details (name, SKU pattern, description) are collected in the app's
+  // PathConfig screen, NOT in the browser overlay — Meesho's page modals use
+  // focus-traps that block injected overlay inputs. So we save with a default
+  // name + a timestamped folder, and the app fills in the rest.
   const now = new Date().toISOString();
+  const stamp = Date.now();
+  const safeName = `recording_${stamp}`;
+
   /** @type {import('../types/models.js').PathConfig} */
   const pathConfig = {
-    name: userConfig.name,
-    skuPattern: userConfig.skuPattern,
-    productDescription: userConfig.productDescription,
+    name: `New Recording ${new Date().toLocaleString('en-IN')}`,
+    skuPattern: '',
+    productDescription: '',
     steps: state.steps,
     fields: state.fields,
     sharedImages: ['img2.jpg', 'img3.jpg', 'img4.jpg'],
+    _folder: safeName,
     createdAt: now,
     updatedAt: now,
   };
 
-  const safeName = userConfig.name.replace(/[^a-z0-9_-]/gi, '_').slice(0, 64);
   const dir = path.join(PATHS_DIR, safeName);
   await fs.mkdir(path.join(dir, 'shared_images'), { recursive: true });
   await fs.writeFile(path.join(dir, 'config.json'), JSON.stringify(pathConfig, null, 2), 'utf8');

@@ -36,6 +36,14 @@ export default function PathConfig({ path, onDone, onCancel, mode = 'configure' 
   }
 
   async function save() {
+    // Validation — these used to be enforced in the browser overlay; now the
+    // app owns it since path details are entered here.
+    if (!name.trim()) { setError('Please enter a path name.'); return; }
+    if (!skuPattern.includes('X')) {
+      setError('SKU pattern must contain X (it gets replaced with a random 5-digit number).');
+      return;
+    }
+
     setSaving(true);
     setError(null);
     try {
@@ -78,6 +86,12 @@ export default function PathConfig({ path, onDone, onCancel, mode = 'configure' 
             : 'Mark which fields use AI generation, then upload the 3 shared images for this product type.'}
         </p>
       </div>
+
+      {!isEdit && !skuPattern && (
+        <div className="bg-meesho-light border border-pink-200 text-meesho-dark rounded-lg p-4 text-sm">
+          🎬 <strong>Recording captured.</strong> Give this path a name, a SKU pattern, and a product description below — then mark which fields the AI should generate and upload your 3 shared images.
+        </div>
+      )}
 
       {/* Metadata */}
       <section className="bg-white rounded-xl border border-gray-200 p-6 space-y-4">

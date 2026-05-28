@@ -33,7 +33,7 @@ router.post('/', async (_req, res) => {
         topic: 'record',
         pathName: pathConfig.name,
         pathConfig,
-        text: `✓ Path "${pathConfig.name}" saved with ${pathConfig.steps.length} steps and ${pathConfig.fields.length} fields.`,
+        text: `✓ Recording saved with ${pathConfig.steps.length} steps and ${pathConfig.fields.length} fields. Name & configure it below.`,
       });
     })
     .catch((err) => {

@@ -44,8 +44,11 @@ export default function App() {
   // ─── WebSocket — central connection shared via context ─────────────────────
   const ws = useWebSocket((msg) => {
     // After recording finishes, automatically jump to the configure screen.
+    // Use the folder the recorder actually saved to (path details are entered
+    // here in the app, so the folder name isn't derived from the path name).
     if (msg.type === 'event' && msg.event === 'recording_complete' && msg.pathConfig) {
-      setConfiguringPath({ ...msg.pathConfig, _folder: msg.pathConfig.name.replace(/[^a-z0-9_-]/gi, '_').slice(0, 64) });
+      const cfg = msg.pathConfig;
+      setConfiguringPath({ ...cfg, _folder: cfg._folder });
       setView('configure');
       refreshPaths();
     }
