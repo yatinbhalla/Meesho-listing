@@ -53,6 +53,24 @@ export default function App() {
     }
   }, []);
 
+  // Clone an existing path, then drop straight into the editor on the copy so
+  // the user can change just colour / name / SKU without re-recording.
+  const duplicatePath = useCallback(async (pathSummary) => {
+    try {
+      const res = await fetch(`/api/paths/${encodeURIComponent(pathSummary._folder)}/duplicate`, { method: 'POST' });
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}));
+        throw new Error(e.error || 'Failed to duplicate path.');
+      }
+      const copy = await res.json();
+      await refreshPaths();
+      setEditingPath(copy);
+      setView('edit');
+    } catch (err) {
+      alert(err.message);
+    }
+  }, [refreshPaths]);
+
   // A path is "unconfigured" if it still has no SKU pattern — i.e. a fresh
   // recording the user hasn't named/configured yet. Clicking it should open the
   // Configure screen, not the listing screen (which would be a dead end).
@@ -163,6 +181,7 @@ export default function App() {
               onPathsChanged={refreshPaths}
               paths={paths}
               onEditPath={openEditor}
+              onDuplicatePath={duplicatePath}
             />
           )}
         </main>

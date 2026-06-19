@@ -71,6 +71,45 @@ router.patch('/:name', async (req, res) => {
   }
 });
 
+// ─── POST /api/paths/:name/duplicate — clone a path ───────────────────────────
+// WHY: product variants (e.g. the same item in different colours) share the
+// entire recorded workflow. Cloning a path lets the user tweak just the few
+// fields that differ (colour, name, SKU pattern, description) instead of
+// re-recording and re-verifying the whole path. The clone copies the config AND
+// the shared images, so it's runnable immediately.
+router.post('/:name/duplicate', async (req, res) => {
+  try {
+    const { config } = await loadConfig(req.params.name);
+
+    const newFolder = `recording_${Date.now()}`;
+    const newDir = path.join(PATHS_DIR, newFolder);
+    await fs.mkdir(newDir, { recursive: true });
+
+    const now = new Date().toISOString();
+    const clone = { ...config, name: `${config.name || 'Untitled'} (copy)`, createdAt: now, updatedAt: now };
+    delete clone._folder;
+    delete clone._sharedImagesReady;
+
+    await fs.writeFile(path.join(newDir, 'config.json'), JSON.stringify(clone, null, 2), 'utf8');
+
+    // Copy shared images too, so the clone can run without re-uploading them.
+    try {
+      await fs.cp(
+        path.join(PATHS_DIR, req.params.name, 'shared_images'),
+        path.join(newDir, 'shared_images'),
+        { recursive: true },
+      );
+    } catch { /* source path had no shared images — nothing to copy */ }
+
+    clone._folder = newFolder;
+    clone._sharedImagesReady = await sharedImagesPresent(newFolder);
+    res.status(201).json(clone);
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'Path not found.' });
+    res.status(500).json({ error: `Failed to duplicate path: ${err.message}` });
+  }
+});
+
 // ─── DELETE /api/paths/:name ──────────────────────────────────────────────────
 router.delete('/:name', async (req, res) => {
   try {

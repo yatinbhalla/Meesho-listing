@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
 
-export default function Settings({ paths, onPathsChanged, onEditPath }) {
+export default function Settings({ paths, onPathsChanged, onEditPath, onDuplicatePath }) {
   const [tab, setTab] = useState('credentials');
   return (
     <div className="max-w-3xl mx-auto p-6 space-y-6">
@@ -23,7 +23,7 @@ export default function Settings({ paths, onPathsChanged, onEditPath }) {
       </div>
 
       {tab === 'credentials' && <CredentialsTab />}
-      {tab === 'paths'       && <PathsTab paths={paths} onPathsChanged={onPathsChanged} onEditPath={onEditPath} />}
+      {tab === 'paths'       && <PathsTab paths={paths} onPathsChanged={onPathsChanged} onEditPath={onEditPath} onDuplicatePath={onDuplicatePath} />}
       {tab === 'skus'        && <SkusTab />}
     </div>
   );
@@ -146,12 +146,17 @@ function Field({ label, type = 'text', value, onChange, placeholder, hint }) {
   );
 }
 
-function PathsTab({ paths, onPathsChanged, onEditPath }) {
+function PathsTab({ paths, onPathsChanged, onEditPath, onDuplicatePath }) {
+  const [busy, setBusy] = useState(null);
   async function del(folder, name) {
     if (!confirm(`Delete path "${name}"? This removes the config and shared images permanently.`)) return;
     const res = await fetch(`/api/paths/${folder}`, { method: 'DELETE' });
     if (res.ok) onPathsChanged();
     else alert('Failed to delete.');
+  }
+  async function duplicate(p) {
+    setBusy(p._folder);
+    try { await onDuplicatePath(p); } finally { setBusy(null); }
   }
   return (
     <div className="bg-white rounded-xl border border-gray-200">
@@ -170,6 +175,14 @@ function PathsTab({ paths, onPathsChanged, onEditPath }) {
                 onClick={() => onEditPath(p)}
                 className="px-3 py-1 text-sm text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
               >Edit</button>
+            )}
+            {onDuplicatePath && (
+              <button
+                onClick={() => duplicate(p)}
+                disabled={busy === p._folder}
+                title="Make a copy of this path to tweak (e.g. a different colour variant)"
+                className="px-3 py-1 text-sm text-meesho-pink hover:bg-pink-50 rounded-lg transition-colors disabled:text-gray-300"
+              >{busy === p._folder ? 'Copying…' : 'Duplicate'}</button>
             )}
             <button
               onClick={() => del(p._folder, p.name)}
