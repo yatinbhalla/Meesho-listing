@@ -148,6 +148,9 @@ function Field({ label, type = 'text', value, onChange, placeholder, hint }) {
 
 function PathsTab({ paths, onPathsChanged, onEditPath, onDuplicatePath }) {
   const [busy, setBusy] = useState(null);
+  const [importing, setImporting] = useState(false);
+  const fileRef = React.useRef(null);
+
   async function del(folder, name) {
     if (!confirm(`Delete path "${name}"? This removes the config and shared images permanently.`)) return;
     const res = await fetch(`/api/paths/${folder}`, { method: 'DELETE' });
@@ -158,8 +161,65 @@ function PathsTab({ paths, onPathsChanged, onEditPath, onDuplicatePath }) {
     setBusy(p._folder);
     try { await onDuplicatePath(p); } finally { setBusy(null); }
   }
+  // Download a single-file backup (config + shared images) for the path.
+  async function exportPath(p) {
+    try {
+      const res = await fetch(`/api/paths/${encodeURIComponent(p._folder)}/export`);
+      if (!res.ok) throw new Error('Export failed.');
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${(p.name || 'path').replace(/[^a-z0-9._-]+/gi, '_')}.meesho-path.json`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert(err.message);
+    }
+  }
+  // Restore a path from a backup file.
+  async function importPath(file) {
+    if (!file) return;
+    setImporting(true);
+    try {
+      const fd = new FormData();
+      fd.append('backup', file);
+      const res = await fetch('/api/paths/import', { method: 'POST', body: fd });
+      if (!res.ok) {
+        const e = await res.json().catch(() => ({}));
+        throw new Error(e.error || 'Import failed.');
+      }
+      const restored = await res.json();
+      await onPathsChanged();
+      if (onEditPath) onEditPath(restored);   // open the restored path so the user can review it
+      else alert(`Restored "${restored.name}".`);
+    } catch (err) {
+      alert(err.message);
+    } finally {
+      setImporting(false);
+      if (fileRef.current) fileRef.current.value = '';
+    }
+  }
+
   return (
     <div className="bg-white rounded-xl border border-gray-200">
+      <div className="flex items-center justify-between p-3 border-b border-gray-100">
+        <p className="text-xs text-gray-500">Back up a path to a file, or restore one from a backup.</p>
+        <input
+          ref={fileRef}
+          type="file"
+          accept=".json,application/json"
+          className="hidden"
+          onChange={(e) => importPath(e.target.files?.[0])}
+        />
+        <button
+          onClick={() => fileRef.current?.click()}
+          disabled={importing}
+          className="px-3 py-1 text-sm text-meesho-pink border border-meesho-pink rounded-lg hover:bg-pink-50 transition-colors disabled:opacity-50"
+        >{importing ? 'Importing…' : '⬆ Import path'}</button>
+      </div>
       {paths.length === 0 && <p className="p-6 text-sm text-gray-400 text-center">No paths recorded yet.</p>}
       {paths.map((p) => (
         <div key={p._folder} className="flex items-center justify-between p-4 border-b border-gray-100 last:border-0 gap-3">
@@ -184,6 +244,11 @@ function PathsTab({ paths, onPathsChanged, onEditPath, onDuplicatePath }) {
                 className="px-3 py-1 text-sm text-meesho-pink hover:bg-pink-50 rounded-lg transition-colors disabled:text-gray-300"
               >{busy === p._folder ? 'Copying…' : 'Duplicate'}</button>
             )}
+            <button
+              onClick={() => exportPath(p)}
+              title="Download a backup file (config + shared images) to restore this path later"
+              className="px-3 py-1 text-sm text-gray-700 hover:bg-gray-100 rounded-lg transition-colors"
+            >Export</button>
             <button
               onClick={() => del(p._folder, p.name)}
               className="px-3 py-1 text-sm text-red-600 hover:bg-red-50 rounded-lg transition-colors"

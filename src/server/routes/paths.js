@@ -110,6 +110,98 @@ router.post('/:name/duplicate', async (req, res) => {
   }
 });
 
+// ─── GET /api/paths/:name/export — download a single-file backup ──────────────
+// WHY: a recorded path lives only on this machine. Exporting it as one
+// self-contained JSON file (the config PLUS the shared images, base64-encoded)
+// lets the user back it up and restore it later — even if the path folder is
+// deleted. Login credentials are stripped so the backup never carries secrets.
+router.get('/:name/export', async (req, res) => {
+  try {
+    const { config } = await loadConfig(req.params.name);
+    delete config._folder;
+    delete config._sharedImagesReady;
+    for (const f of (config.fields || [])) {
+      if (/password|emailorphone/i.test(f.selector || '')) f.fixedValue = '';
+    }
+
+    // Bundle the shared images so a restore needs nothing else.
+    const images = {};
+    const imgDir = path.join(PATHS_DIR, req.params.name, 'shared_images');
+    try {
+      for (const file of await fs.readdir(imgDir)) {
+        if (/\.(jpe?g|png|webp)$/i.test(file)) {
+          images[file] = (await fs.readFile(path.join(imgDir, file))).toString('base64');
+        }
+      }
+    } catch { /* path has no shared images — nothing to bundle */ }
+
+    const backup = {
+      meeshoPathBackup: 1,
+      exportedAt: new Date().toISOString(),
+      config,
+      images,
+    };
+    const safe = (config.name || req.params.name).replace(/[^a-z0-9._-]+/gi, '_');
+    res.setHeader('Content-Type', 'application/json');
+    res.setHeader('Content-Disposition', `attachment; filename="${safe}.meesho-path.json"`);
+    res.send(JSON.stringify(backup, null, 2));
+  } catch (err) {
+    if (err.code === 'ENOENT') return res.status(404).json({ error: 'Path not found.' });
+    res.status(500).json({ error: `Failed to export path: ${err.message}` });
+  }
+});
+
+// ─── POST /api/paths/import — restore a path from a backup file ────────────────
+// Accepts the backup as an uploaded file (multipart) so the embedded images can
+// exceed the small global JSON body limit. Recreates the path in a fresh folder.
+const backupUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 80 * 1024 * 1024 },
+});
+router.post('/import', backupUpload.single('backup'), async (req, res) => {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No backup file uploaded.' });
+    let backup;
+    try { backup = JSON.parse(req.file.buffer.toString('utf8')); }
+    catch { return res.status(400).json({ error: 'Backup file is not valid JSON.' }); }
+    if (backup.meeshoPathBackup !== 1 || !backup.config) {
+      return res.status(400).json({ error: 'Not a valid Meesho path backup file.' });
+    }
+
+    const newFolder = `recording_${Date.now()}`;
+    const newDir = path.join(PATHS_DIR, newFolder);
+    await fs.mkdir(newDir, { recursive: true });
+
+    const now = new Date().toISOString();
+    const config = { ...backup.config };
+    delete config._folder;
+    delete config._sharedImagesReady;
+    config.updatedAt = now;
+    if (!config.createdAt) config.createdAt = now;
+    // Never restore credentials from a (possibly old) backup.
+    for (const f of (config.fields || [])) {
+      if (/password|emailorphone/i.test(f.selector || '')) f.fixedValue = '';
+    }
+    await fs.writeFile(path.join(newDir, 'config.json'), JSON.stringify(config, null, 2), 'utf8');
+
+    // Restore shared images.
+    const images = backup.images || {};
+    if (Object.keys(images).length) {
+      const restoreDir = path.join(newDir, 'shared_images');
+      await fs.mkdir(restoreDir, { recursive: true });
+      for (const [name, b64] of Object.entries(images)) {
+        await fs.writeFile(path.join(restoreDir, path.basename(name)), Buffer.from(b64, 'base64'));
+      }
+    }
+
+    config._folder = newFolder;
+    config._sharedImagesReady = await sharedImagesPresent(newFolder);
+    res.status(201).json(config);
+  } catch (err) {
+    res.status(500).json({ error: `Failed to import path: ${err.message}` });
+  }
+});
+
 // ─── DELETE /api/paths/:name ──────────────────────────────────────────────────
 router.delete('/:name', async (req, res) => {
   try {
