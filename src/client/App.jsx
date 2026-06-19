@@ -26,6 +26,20 @@ export default function App() {
     } catch {}
   }, []);
 
+  // Open the CONFIGURE screen for a path (re-fetches latest config to avoid stale state).
+  // Used after recording and when the user clicks an unconfigured path in the sidebar.
+  const openConfigure = useCallback(async (folder) => {
+    try {
+      const res = await fetch(`/api/paths/${encodeURIComponent(folder)}`);
+      if (!res.ok) throw new Error('Path not found.');
+      const full = await res.json();
+      setConfiguringPath(full);
+      setView('configure');
+    } catch (err) {
+      alert(err.message);
+    }
+  }, []);
+
   // Open the editor for an existing path (re-fetches the latest config to avoid stale state).
   const openEditor = useCallback(async (pathSummary) => {
     try {
@@ -38,6 +52,17 @@ export default function App() {
       alert(err.message);
     }
   }, []);
+
+  // A path is "unconfigured" if it still has no SKU pattern — i.e. a fresh
+  // recording the user hasn't named/configured yet. Clicking it should open the
+  // Configure screen, not the listing screen (which would be a dead end).
+  const isUnconfigured = (p) => !p || !p.skuPattern;
+
+  function handleSelectPath(p) {
+    setSelectedPath(p);
+    if (isUnconfigured(p)) openConfigure(p._folder);
+    else setView('list');
+  }
 
   useEffect(() => { refreshPaths(); }, [refreshPaths]);
 
@@ -54,13 +79,41 @@ export default function App() {
     }
   });
 
+  // ─── Fallback: poll for a finished recording while the record view is open ──
+  // WHY: the recording_complete WS event can be missed if the app tab is
+  // backgrounded/throttled while the user watches the Chromium window. Without
+  // this, the user would be stuck on "Recording in Progress" forever. We poll
+  // the paths list; when a fresh unconfigured recording_* path appears, we jump
+  // to the configure screen — same destination as the WS event, just resilient.
+  useEffect(() => {
+    if (view !== 'record') return;
+    let cancelled = false;
+    const timer = setInterval(async () => {
+      try {
+        const res = await fetch('/api/paths');
+        if (!res.ok) return;
+        const list = await res.json();
+        if (cancelled) return;
+        setPaths(list);
+        const fresh = list
+          .filter((p) => p._folder?.startsWith('recording_') && isUnconfigured(p))
+          .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))[0];
+        if (fresh) {
+          clearInterval(timer);
+          openConfigure(fresh._folder);
+        }
+      } catch {}
+    }, 2500);
+    return () => { cancelled = true; clearInterval(timer); };
+  }, [view, openConfigure]);
+
   return (
     <WSContext.Provider value={ws}>
       <div className="flex h-screen bg-gray-50 font-sans text-gray-800">
         <Sidebar
           paths={paths}
           activePath={selectedPath}
-          onSelectPath={(p) => { setSelectedPath(p); setView('list'); }}
+          onSelectPath={handleSelectPath}
           onNewPath={() => setView('record')}
           onSettings={() => setView('settings')}
         />
@@ -81,7 +134,9 @@ export default function App() {
               path={configuringPath}
               onDone={async () => {
                 await refreshPaths();
-                setSelectedPath(configuringPath);
+                // Re-fetch so the listing screen shows the just-entered name/SKU.
+                const refreshed = await fetch(`/api/paths/${encodeURIComponent(configuringPath._folder)}`).then((r) => r.json()).catch(() => null);
+                setSelectedPath(refreshed || configuringPath);
                 setConfiguringPath(null);
                 setView('list');
               }}

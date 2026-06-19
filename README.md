@@ -421,7 +421,11 @@ If you'd like to contribute:
 
 ## 📜 License
 
-[MIT](LICENSE) — fork it, ship it, sell it. Just don't sue me when Meesho changes their UI.
+[PolyForm Noncommercial License 1.0.0](LICENSE.md) — **free for any noncommercial use**: personal projects, learning, hobby use, research, and nonprofit/educational/government use. Fork it, modify it, share it.
+
+**Commercial use is not permitted** under this license — you can't use it in a business to make or save money, ship it inside a paid product, or run it for an enterprise without a separate commercial license. Want to use it commercially? [Reach out](mailto:yatinbhalla42@gmail.com).
+
+(And don't sue me when Meesho changes their UI — the software is provided "as is".)
 
 ---
 

@@ -66,7 +66,9 @@ router.post('/', upload.array('heroImages', MAX_BATCH), async (req, res) => {
     res.status(202).json({ ok: true, message: `Batch of ${req.files.length} listing(s) started.` });
 
     // ─── Background batch run ───────────────────────────────────────────────
-    runBatch({ pathConfig, pathDir, files: req.files })
+    // Explicit per-run diagnostic flag: fill the form but never click Submit.
+    const noSubmit = req.body.noSubmit === 'true' || req.body.noSubmit === true;
+    runBatch({ pathConfig, pathDir, files: req.files, noSubmit })
       .catch((err) => {
         broadcast({ type: 'error', topic: 'run', text: err.message });
       })
@@ -88,7 +90,7 @@ router.post('/', upload.array('heroImages', MAX_BATCH), async (req, res) => {
  * Run one batch: open browser once, generate AI once, loop per hero image.
  * Stops on first failure (per the user's chosen policy).
  */
-async function runBatch({ pathConfig, pathDir, files }) {
+async function runBatch({ pathConfig, pathDir, files, noSubmit = false }) {
   const log = (type, text) => broadcast({ type, text, topic: 'run' });
   const total = files.length;
 
@@ -128,7 +130,7 @@ async function runBatch({ pathConfig, pathDir, files }) {
     });
 
     try {
-      await runOneListing({ pathConfig, pathDir, heroImagePath: file.path, aiValues, sku, page });
+      await runOneListing({ pathConfig, pathDir, heroImagePath: file.path, aiValues, sku, page, noSubmit });
       succeededSkus.push(sku);
       broadcast({
         type: 'event', event: 'batch_item_complete', topic: 'run',
@@ -156,9 +158,9 @@ async function runBatch({ pathConfig, pathDir, files }) {
  * Run a single listing in an existing browser session.
  * Wraps executeRun's emitter into a Promise.
  */
-function runOneListing({ pathConfig, pathDir, heroImagePath, aiValues, sku, page }) {
+function runOneListing({ pathConfig, pathDir, heroImagePath, aiValues, sku, page, noSubmit }) {
   return new Promise((resolve, reject) => {
-    const emitter = executeRun({ pathConfig, heroImagePath, pathDir, aiValues, sku, page });
+    const emitter = executeRun({ pathConfig, heroImagePath, pathDir, aiValues, sku, page, noSubmit });
     emitter.on('log',   (msg) => broadcast({ ...msg, topic: 'run' }));
     emitter.once('done',  () => resolve());
     emitter.once('error', (err) => reject(err));

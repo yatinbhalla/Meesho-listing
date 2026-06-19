@@ -34,9 +34,14 @@ const READY_TIMEOUT_MS = 15_000;
  *   batch mode in run.js so all listings in a batch share one Chromium window.
  * @returns {EventEmitter}
  */
-export function executeRun({ pathConfig, heroImagePath, pathDir, aiValues = {}, sku = '', page = null }) {
+export function executeRun({ pathConfig, heroImagePath, pathDir, aiValues = {}, sku = '', page = null, noSubmit = false }) {
   const emitter = new EventEmitter();
   const log = (type, text) => emitter.emit('log', { type, text });
+
+  // Diagnostic no-submit mode can be requested per-run (preferred, explicit) or
+  // via the MEESHO_NO_SUBMIT=1 env var (global fallback). Either fills the whole
+  // form but stops at "Submit Catalog" so a test run never publishes a listing.
+  const noSubmitMode = noSubmit || process.env.MEESHO_NO_SUBMIT === '1';
 
   process.nextTick(() => runFlow().catch((err) => {
     log('error', err.message);
@@ -62,6 +67,7 @@ export function executeRun({ pathConfig, heroImagePath, pathDir, aiValues = {}, 
     // fail. We skip them and resume at the first post-login navigate.
     let inLoginFlow = false;
     let skipped = 0;
+    let reachedSubmit = false;   // no-submit mode: true once we hit "Submit Catalog"
 
     for (let i = 0; i < pathConfig.steps.length; i++) {
       const step = pathConfig.steps[i];
@@ -99,18 +105,33 @@ export function executeRun({ pathConfig, heroImagePath, pathDir, aiValues = {}, 
 
       // ─── Skip-login-when-already-logged-in ────────────────────────────────
       if (step.action === 'navigate') {
-        const targetIsLogin = isLoginUrl(step.value);
-        if (targetIsLogin && isPostLoginUrl(activePage.url())) {
-          log('info', `${progress} ⏭  Already logged in — skipping nav to login (${step.label}).`);
-          inLoginFlow = true;
-          skipped++;
-          continue;
-        }
-        inLoginFlow = targetIsLogin;
+        // WHY: we no longer skip the navigate-to-login step based on the URL
+        // *before* navigating. That URL is unreliable — a fresh navigate to the
+        // dashboard hasn't client-side-redirected to /login yet, so a logged-OUT
+        // session still looks "logged in" (any non-login meesho URL passes
+        // isPostLoginUrl), making us wrongly skip login and break the run.
+        // Instead we always navigate to the login URL and let Meesho decide: a
+        // live session bounces straight to the dashboard (caught by the
+        // settle-wait above + the post-login skip below); a dead one lands on the
+        // login form, which we then fill normally.
+        inLoginFlow = isLoginUrl(step.value);
       } else if (inLoginFlow && isPostLoginUrl(activePage.url())) {
         log('info', `${progress} ⏭  Skipping login-form ${step.action} (already logged in).`);
         skipped++;
         continue;
+      }
+
+      // Diagnostic guard — when MEESHO_NO_SUBMIT=1, fill the whole form but stop
+      // at "Submit Catalog" and skip EVERYTHING after it (the declaration
+      // checkbox, Update Changes, Proceed) — those only exist in the submission
+      // flow, so a test run never publishes a listing.
+      if (noSubmitMode) {
+        if (reachedSubmit || /^submit catalog$/i.test((step.label || '').trim())) {
+          reachedSubmit = true;
+          log('info', `${progress} ⏭  [no-submit mode] skipping "${step.label}".`);
+          skipped++;
+          continue;
+        }
       }
 
       log('info', `${progress} ${stepLabel(step)}`);
@@ -118,8 +139,35 @@ export function executeRun({ pathConfig, heroImagePath, pathDir, aiValues = {}, 
       // Active readiness check — replaces the old fixed delay.
       await waitForReady(activePage, step, log);
 
+      ctx.currentStepIndex = i;   // lets executeStep look ahead (auto-open dropdowns)
+
+      // A click whose only purpose is to focus an input right before a fill on a
+      // concrete selector is non-essential: Playwright's fill() focuses the field
+      // itself. Recorded login "focus clicks" use brittle text= label selectors
+      // (e.g. text="Email Id or mobile number…") that often don't resolve — when
+      // they fail we skip them rather than aborting the run or pausing for manual
+      // recovery, since the following fill targets the field directly anyway.
+      const nextStep = pathConfig.steps[i + 1];
+      const softClick = step.action === 'click'
+        && nextStep && nextStep.action === 'fill'
+        && isTypeableInputSelector(nextStep.selector);
+
+      // Fast-path: a non-essential focus-click whose target isn't readily present
+      // is skipped immediately rather than grinding the full ~90s retry ladder —
+      // the following fill focuses the field on its own. (Brittle recorded login
+      // label-clicks like text="Show Password Password" hit this path.)
+      if (softClick) {
+        const quickHit = await activePage.locator(step.selector).first()
+          .isVisible({ timeout: 1500 }).catch(() => false);
+        if (!quickHit) {
+          log('info', `${progress} ⏭  Skipping non-essential focus-click "${step.label}" — next step fills the field directly.`);
+          skipped++;
+          continue;
+        }
+      }
+
       try {
-        await runStepWithRetry(step, i, ctx);
+        await runStepWithRetry(step, i, ctx, softClick);
       } catch (e) {
         log('error', `Step "${step.label}" failed permanently: ${e.message}`);
         throw e;
@@ -150,7 +198,7 @@ function stepLabel(step) {
  * Run a single step. Retries on transient failures, then offers recovery
  * (user clicks the correct element in the browser) for permanent selector breaks.
  */
-async function runStepWithRetry(step, stepIndex, ctx) {
+async function runStepWithRetry(step, stepIndex, ctx, soft = false) {
   let lastErr;
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     try {
@@ -165,6 +213,13 @@ async function runStepWithRetry(step, stepIndex, ctx) {
         await ctx.page.waitForTimeout(delay);
       }
     }
+  }
+
+  // Non-essential focus-click that failed — skip it. The following fill targets
+  // the field directly, so we neither abort nor pause for manual recovery.
+  if (soft) {
+    ctx.log('info', `  ⏭  Skipping non-essential focus-click "${step.label}" — the next step fills the field directly.`);
+    return;
   }
 
   // Retries exhausted — try recovery if this step has a selector to update.
@@ -240,6 +295,18 @@ async function executeStep(step, ctx) {
     return;
   }
   if (step.action === 'click') {
+    // Custom checkbox steps (size "Free Size", the post-submit declaration,
+    // etc.): toggle by clicking the checkbox element next to its text. Recorded
+    // selectors for these are unreliable (positional paths, or invalid ids built
+    // from the label sentence), so we resolve by the checkbox's TEXT instead.
+    if (step.kind === 'checkbox') {
+      const cbText = step.checkboxText || cleanCheckboxText(step.label);
+      const ok = await clickCheckboxByText(page, cbText, ctx.log);
+      if (ok) return;
+      ctx.log('info', `☐ Could not resolve checkbox "${truncate(cbText, 50)}" by text — falling back to its selector.`);
+      // fall through to the normal click ladder with the recorded selector
+    }
+
     // Skip clicks on file inputs — they're usually hidden behind a styled
     // button, so clicking fails ("element not visible"). The upload is handled
     // by the subsequent fill step (setInputFiles works on hidden inputs).
@@ -250,7 +317,58 @@ async function executeStep(step, ctx) {
       ctx.log('info', `↪ ${step.label}: file input — upload handled by the fill step, skipping click.`);
       return;
     }
-    await smartClick(page, step.selector, step.label);
+    // Dropdown OPTION clicks (text="X" followed by a fill on a #control):
+    // route through a dedicated handler that scopes everything to the OPEN
+    // dropdown menu. This fixes the numeric-option ambiguity ("0.5" / "40"
+    // appear all over the page once values are set) and the missing open-click /
+    // search-filter gaps in one place.
+    const optText = optionTextFromSelector(step.selector);
+    if (optText) {
+      const ctrl = findFollowingControl(ctx.pathConfig.steps, ctx.currentStepIndex);
+      const done = await selectDropdownOption(page, optText, ctrl, ctx.log);
+      if (done) return;
+      ctx.log('info', `↪ option "${optText}" not resolved in a menu — falling back to plain click.`);
+    }
+
+    // Self-heal a recorder mis-capture: a dropdown OPTION click is sometimes
+    // recorded with the dropdown's own #control id as the selector (instead of
+    // the option's text=…), so a naive replay just re-clicks the control and
+    // selects nothing. Detect it — a click whose selector is the SAME #control a
+    // nearby preceding step opened, but whose label is a concrete value (not
+    // "Select"/"Search") — and route it by the label through the menu-scoped
+    // option handler. Falls through to a normal click if no such option exists.
+    if (!optText) {
+      const healedOpt = optionFromRepeatedControlClick(step, ctx);
+      if (healedOpt) {
+        const done = await selectDropdownOption(page, healedOpt, step.selector, ctx.log);
+        if (done) {
+          ctx.log('info', `↪ healed mis-recorded option click → selected "${truncate(healedOpt, 40)}".`);
+          return;
+        }
+        ctx.log('info', `↪ "${truncate(healedOpt, 40)}" not in an open menu — falling back to plain click.`);
+      }
+    }
+
+    // WHY: a click right after typing into a search box is almost always
+    // selecting that search result. Prefer the option matching what was typed,
+    // then clear it so it only influences the immediately-following click.
+    const preferText = ctx.lastTypedValue || '';
+    ctx.lastTypedValue = null;
+
+    // Duplicate-ID disambiguation: Meesho renders TWO controls with the same id
+    // (e.g. id="size" — a size-chart dialog AND a plain dropdown). A plain
+    // `#size` selector can't tell them apart. We track how many times each
+    // selector has been clicked and target the Nth occurrence in DOM order, so
+    // the first `#size` click hits the first control and the second hits the
+    // second. Only applied to bare #id selectors (class/text selectors that are
+    // intentionally reused stay on the visible-first path).
+    let occurrence = 0;
+    if (/^#[A-Za-z][\w-]*$/.test(step.selector || '')) {
+      ctx.selectorClicks = ctx.selectorClicks || {};
+      occurrence = ctx.selectorClicks[step.selector] || 0;
+      ctx.selectorClicks[step.selector] = occurrence + 1;
+    }
+    await smartClick(page, step.selector, step.label, preferText, occurrence);
     return;
   }
   if (step.action === 'select') {
@@ -263,13 +381,74 @@ async function executeStep(step, ctx) {
     return;
   }
   if (step.action === 'fill') {
-    const field = ctx.pathConfig.fields[step.fieldRef];
-    if (!field) throw new Error(`Field index ${step.fieldRef} not found in path config.`);
+    const field = resolveFillField(step, ctx);
     await fillField(page, field, ctx);
     if (field.type === 'image') ctx.imageSlot++;
     return;
   }
   throw new Error(`Unknown step action: ${step.action}`);
+}
+
+/**
+ * Resolve which value a fill step writes — ROBUSTLY, so a corrupted/misaligned
+ * fieldRef index can't make a search box upload an image (or vice-versa).
+ *
+ * Priority:
+ *   1. Inline `valueType` on the step (explicit, self-contained).
+ *   2. A field whose SELECTOR matches the step's selector. Matching by selector
+ *      instead of array index is immune to add/delete/reorder edits. When
+ *      several fields share a selector (e.g. a fixed + an AI variant of the same
+ *      input), prefer the AI/SKU/image one over an empty fixed.
+ *   3. The fieldRef'd field — but ONLY if its selector matches the step's
+ *      (a mismatched index is corruption and must be ignored).
+ *   4. The step's own inline `value` as a plain fixed fill.
+ */
+function resolveFillField(step, ctx) {
+  const fields = ctx.pathConfig.fields || [];
+
+  if (step.valueType) {
+    return {
+      fieldName: step.label || step.selector, selector: step.selector,
+      type: step.valueType, fixedValue: step.value ?? '',
+      aiPrompt: step.aiPrompt, imageRole: step.imageRole,
+    };
+  }
+
+  const bySelector = fields.filter((f) => f.selector && f.selector === step.selector);
+  let f = null;
+  if (bySelector.length === 1) {
+    f = bySelector[0];
+  } else if (bySelector.length > 1) {
+    f = bySelector.find((x) => x.type === 'ai')
+      || bySelector.find((x) => x.type === 'sku' || x.type === 'image')
+      || bySelector.find((x) => x.type === 'fixed' && x.fixedValue)
+      || bySelector[0];
+  }
+
+  // fieldRef fallback — only trust it if its selector matches the step's.
+  if (!f && step.fieldRef != null) {
+    const cand = fields[step.fieldRef];
+    if (cand && (!cand.selector || cand.selector === step.selector)) f = cand;
+  }
+
+  if (f) {
+    // A matched-but-empty fixed field, when the step carries its own value,
+    // should use the step's value (covers older configs that stored value on the step).
+    if (f.type === 'fixed' && !f.fixedValue && step.value) {
+      return { ...f, fixedValue: String(step.value) };
+    }
+    return f;
+  }
+
+  // No usable field — use the step's own value (or empty) as a fixed fill.
+  if (step.value != null) {
+    return {
+      fieldName: step.label || step.selector, selector: step.selector,
+      type: 'fixed', fixedValue: String(step.value),
+    };
+  }
+
+  throw new Error(`Fill step "${step.label}" has no resolvable value (selector ${step.selector}).`);
 }
 
 /**
@@ -291,19 +470,275 @@ async function waitForReady(page, step, log) {
   await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
 
   if (step.selector && step.action !== 'navigate') {
+    // Option-style selectors (text="…") belong to a dropdown that often isn't
+    // open yet — the click handler auto-opens it. Don't burn the full 15s here;
+    // a short wait is enough, then let the click's open-preflight take over.
+    const isOption = /^text=/.test(step.selector);
+    const timeout = isOption ? 2500 : READY_TIMEOUT_MS;
     try {
-      await page.waitForSelector(step.selector, {
-        state: 'attached',
-        timeout: READY_TIMEOUT_MS,
-      });
+      await page.waitForSelector(step.selector, { state: 'attached', timeout });
     } catch {
-      // Don't throw here — let the step itself handle the missing-selector
-      // case (which has its own retry + recovery flow).
-      log('info', `  ⌛ ${step.selector} didn't appear within ${READY_TIMEOUT_MS}ms — continuing anyway.`);
+      // Don't throw — the step's own retry + auto-open + recovery flow handles it.
+      if (!isOption) {
+        log('info', `  ⌛ ${step.selector} didn't appear within ${timeout}ms — continuing anyway.`);
+      }
     }
   }
 
   await page.waitForTimeout(SETTLE_MS);
+}
+
+/**
+ * Resolve a selector to the best matching element:
+ *   1. If `preferText` is given and a VISIBLE match contains that text, use it.
+ *      (Critical for search→select: after typing "table cloth", the next click
+ *      on a generic `[data-testid="resultRow"]` must land on the row that
+ *      actually says "Table Cloths", not whichever row is first.)
+ *   2. Otherwise the first VISIBLE match.
+ *   3. Otherwise the first match (so hidden file inputs still resolve).
+ * Bounded scan so a selector matching hundreds of nodes can't stall us.
+ */
+async function firstVisible(page, selector, preferText) {
+  const all = page.locator(selector);
+  let count = 0;
+  try { count = await all.count(); } catch { return all.first(); }
+  if (count <= 1) return all.first();
+
+  const scan = Math.min(count, 30);
+  const visibles = [];
+  for (let i = 0; i < scan; i++) {
+    const nth = all.nth(i);
+    if (await nth.isVisible().catch(() => false)) visibles.push(nth);
+  }
+  if (visibles.length === 0) return all.first();
+
+  const pt = String(preferText || '').trim().toLowerCase();
+  if (pt) {
+    for (const v of visibles) {
+      const t = (await v.innerText().catch(() => '') || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      if (t && t.includes(pt)) return v;
+    }
+  }
+  return visibles[0];
+}
+
+/**
+ * Click a CUSTOM checkbox identified by its visible text — robustly.
+ *
+ * WHY: Meesho's checkboxes (size "Free Size", the post-submit "I understand…"
+ * declaration, etc.) are not <input type=checkbox> with a <label>. They're a
+ * styled <svg> sitting next to a text node, and ONLY a real pointer click on
+ * the svg/box toggles them — clicking the text is a no-op, and a synthetic
+ * .click() on the row does nothing. So we locate the checkbox element in the
+ * DOM (svg sibling of the text, or a real checkbox input in the same row), tag
+ * it, and let Playwright do a real pointer click on it.
+ *
+ * Returns true if it found and clicked a checkbox, false otherwise.
+ */
+async function clickCheckboxByText(page, text, log) {
+  const target = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!target) return false;
+
+  // Tag the checkbox element (browser side) so Playwright can click it.
+  const found = await page.evaluate((wanted) => {
+    const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+    const w = wanted.toLowerCase();
+    document.querySelectorAll('[data-meesho-cb]').forEach((e) => e.removeAttribute('data-meesho-cb'));
+
+    // Find the smallest VISIBLE element whose text matches (exact, else contains).
+    const all = Array.from(document.querySelectorAll('body *'));
+    const visible = (el) => el.offsetParent !== null || (el.getClientRects && el.getClientRects().length);
+    let textEl =
+      all.find((el) => visible(el) && norm(el.innerText) .toLowerCase() === w && el.children.length === 0) ||
+      all.find((el) => visible(el) && norm(el.textContent).toLowerCase() === w && el.children.length <= 1) ||
+      all.find((el) => visible(el) && norm(el.textContent).toLowerCase().includes(w) && el.children.length <= 2);
+    if (!textEl) return null;
+
+    // 1. A checkbox input in the nearest row ancestor.
+    let row = textEl;
+    for (let i = 0; i < 5 && row.parentElement; i++) {
+      const input = row.querySelector && row.querySelector('input[type="checkbox"]');
+      if (input) { input.setAttribute('data-meesho-cb', '1'); return 'input'; }
+      row = row.parentElement;
+    }
+    // 2. An <svg> that is the previous sibling of the text (the size pattern).
+    if (textEl.previousElementSibling && textEl.previousElementSibling.tagName.toLowerCase() === 'svg') {
+      textEl.previousElementSibling.setAttribute('data-meesho-cb', '1'); return 'svg-prev';
+    }
+    // 3. Any <svg> within the nearest small row ancestor.
+    row = textEl;
+    for (let i = 0; i < 4 && row.parentElement; i++) {
+      const svg = row.querySelector && row.querySelector('svg');
+      if (svg) { svg.setAttribute('data-meesho-cb', '1'); return 'svg-row'; }
+      row = row.parentElement;
+    }
+    // 4. Fallback: tag the text element's parent row to click it directly.
+    (textEl.parentElement || textEl).setAttribute('data-meesho-cb', '1');
+    return 'row';
+  }, target).catch(() => null);
+
+  if (!found) return false;
+
+  try {
+    await page.locator('[data-meesho-cb="1"]').first().click({ timeout: 5000 });
+    log && log('info', `  ☑ checkbox "${truncate(target, 50)}" clicked (${found}).`);
+    await page.evaluate(() => document.querySelectorAll('[data-meesho-cb]').forEach((e) => e.removeAttribute('data-meesho-cb'))).catch(() => {});
+    return true;
+  } catch {
+    await page.evaluate(() => document.querySelectorAll('[data-meesho-cb]').forEach((e) => e.removeAttribute('data-meesho-cb'))).catch(() => {});
+    return false;
+  }
+}
+
+/** Extract the option text from a `text="X"` / `text=X` selector. */
+function optionTextFromSelector(selector) {
+  const m = /^text=(?:"([\s\S]*)"|([\s\S]*))$/.exec(String(selector || '').trim());
+  if (!m) return '';
+  return (m[1] != null ? m[1] : m[2] || '').replace(/\\"/g, '"').trim();
+}
+
+/**
+ * Type a value into the search box of an OPEN dropdown so a search-filtered
+ * option (Meesho's dimension dropdowns: "40", "0.5", "12", "60", …) renders.
+ * Targets the visible search input inside the open menu/popover. Returns true
+ * if it typed into one.
+ */
+async function typeIntoDropdownSearch(page, value, log) {
+  // WHY tagging: the page's TOP category search is also a `.MuiInputBase-inputAdornedStart`
+  // and is the FIRST visible such input — typing the value there does nothing for
+  // the open dropdown. We pick the search box INSIDE the open dropdown
+  // (popover/menu), else the LAST visible search input on the page (dropdown
+  // searches render after the page's main search), and tag it for Playwright.
+  const tagged = await page.evaluate(() => {
+    document.querySelectorAll('[data-meesho-search]').forEach((e) => e.removeAttribute('data-meesho-search'));
+    const visible = (el) => {
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+    };
+    const isSearchish = (el) =>
+      el.tagName === 'INPUT' &&
+      !['hidden', 'checkbox', 'radio', 'file', 'submit', 'button'].includes((el.type || '').toLowerCase()) &&
+      (/MuiInputBase-inputAdornedStart/.test(el.className) || /search/i.test(el.placeholder || '') || el.closest('[role="presentation"], .MuiPopover-paper, .MuiMenu-paper, ul[role="menu"], .MuiAutocomplete-popper'));
+
+    const all = Array.from(document.querySelectorAll('input')).filter((el) => isSearchish(el) && visible(el));
+    if (!all.length) return false;
+    // Prefer one inside an open popover/menu; else the last visible (the just-opened dropdown).
+    const inPopover = all.filter((el) => el.closest('[role="presentation"], .MuiPopover-paper, .MuiMenu-paper, ul[role="menu"], .MuiAutocomplete-popper'));
+    const chosen = (inPopover.length ? inPopover[inPopover.length - 1] : all[all.length - 1]);
+    chosen.setAttribute('data-meesho-search', '1');
+    return true;
+  }).catch(() => false);
+
+  if (!tagged) return false;
+  try {
+    const loc = page.locator('[data-meesho-search="1"]').first();
+    await loc.fill('', { timeout: 2000 }).catch(() => {});
+    await loc.fill(String(value), { timeout: 3000 });
+    log && log('info', `  ⌨ typed "${truncate(String(value), 30)}" into the dropdown's search box to filter the option.`);
+    await page.evaluate(() => document.querySelectorAll('[data-meesho-search]').forEach((e) => e.removeAttribute('data-meesho-search'))).catch(() => {});
+    return true;
+  } catch {
+    await page.evaluate(() => document.querySelectorAll('[data-meesho-search]').forEach((e) => e.removeAttribute('data-meesho-search'))).catch(() => {});
+    return false;
+  }
+}
+
+// Containers that hold an OPEN dropdown's options (MUI menus/popovers/listboxes).
+const OPEN_MENU = 'ul[role="menu"], [role="listbox"], [role="presentation"] ul, .MuiMenu-paper, .MuiPopover-paper, .MuiAutocomplete-popper';
+
+/**
+ * Select an option from a dropdown ROBUSTLY, scoped to the currently-open menu:
+ *   1. If the option text isn't visible inside an open menu, open the dropdown
+ *      (click its #control) — handles recordings missing the open-click.
+ *   2. If still not present, type the value into the menu's search box — handles
+ *      search-filtered dimension dropdowns ("40", "0.5", "12", …).
+ *   3. Click the option, MATCHED INSIDE THE OPEN MENU — so a stray "0.5" already
+ *      shown elsewhere on the page can't be clicked by mistake.
+ * Returns true on success, false to let the caller fall back.
+ */
+async function selectDropdownOption(page, optionText, controlSelector, log) {
+  const menuOption = () => page.locator(OPEN_MENU).getByText(optionText, { exact: true }).first();
+
+  const optionInMenuVisible = async () => {
+    try { return await menuOption().isVisible({ timeout: 800 }); } catch { return false; }
+  };
+  // Is ANY dropdown menu/popover currently open? (so we don't re-click the
+  // control and accidentally TOGGLE an already-open dropdown shut).
+  const anyMenuOpen = async () => {
+    try { return await page.locator(OPEN_MENU).first().isVisible({ timeout: 500 }); } catch { return false; }
+  };
+
+  // 1. Open the dropdown ONLY if nothing is open yet (recordings sometimes miss
+  //    the open-click). If a menu is already open, leave it — we'll filter/click.
+  if (!(await optionInMenuVisible()) && !(await anyMenuOpen()) && controlSelector) {
+    log && log('info', `↻ opening dropdown ${controlSelector} for option "${truncate(optionText, 30)}".`);
+    await smartClick(page, controlSelector, 'open dropdown').catch(() => {});
+    await page.waitForTimeout(600);
+  }
+  // 2. Still not showing → type into the OPEN dropdown's search box to filter it in.
+  if (!(await optionInMenuVisible())) {
+    if (await typeIntoDropdownSearch(page, optionText, log)) {
+      await page.waitForTimeout(700);
+    }
+  }
+  // 3. Click the option inside the open menu.
+  try {
+    const opt = menuOption();
+    if (await opt.isVisible({ timeout: 1500 }).catch(() => false)) {
+      await opt.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => {});
+      await opt.click({ timeout: 4000 });
+      return true;
+    }
+  } catch { /* fall through */ }
+  return false;
+}
+
+/** True if the selector has at least one visible match (bounded scan). */
+async function hasVisible(page, selector) {
+  const all = page.locator(selector);
+  let count = 0;
+  try { count = await all.count(); } catch { return false; }
+  const scan = Math.min(count, 30);
+  for (let i = 0; i < scan; i++) {
+    if (await all.nth(i).isVisible().catch(() => false)) return true;
+  }
+  return false;
+}
+
+/**
+ * Find the dropdown control (#id selector) that the fill step following `idx`
+ * targets — used to auto-open a dropdown whose option-click is missing its
+ * preceding open-click in the recording.
+ */
+function findFollowingControl(steps, idx) {
+  if (!Array.isArray(steps) || idx == null) return null;
+  for (let j = idx + 1; j < Math.min(idx + 3, steps.length); j++) {
+    const s = steps[j];
+    if (s && s.action === 'fill' && /^#/.test(s.selector || '')) return s.selector;
+  }
+  return null;
+}
+
+// Recorder mis-capture heal: returns the option text to select when a click step
+// is really an option-pick that got recorded with the dropdown's own #control id
+// (instead of text="value"). Conditions: this step's selector is a #control, a
+// preceding step within the last 3 opened that SAME control, and the label is a
+// concrete value rather than a generic action word ("Select", "Search", …).
+function optionFromRepeatedControlClick(step, ctx) {
+  const sel = step.selector || '';
+  if (!/^#/.test(sel)) return null;
+  const label = (step.label || '').trim();
+  if (!label || /^(select|search|open|click|choose)\b/i.test(label)) return null;
+
+  const steps = ctx.pathConfig.steps || [];
+  const idx = ctx.currentStepIndex;
+  if (idx == null) return null;
+  for (let j = idx - 1; j >= 0 && j >= idx - 3; j--) {
+    const p = steps[j];
+    if (p && p.action === 'click' && p.selector === sel) return label;
+  }
+  return null;
 }
 
 /**
@@ -320,8 +755,24 @@ async function waitForReady(page, step, log) {
  * @param {string} [label] - the recorded step label (option text), used for the
  *   role/text-based dropdown-option fallback.
  */
-async function smartClick(page, selector, label = '') {
-  const locator = page.locator(selector).first();
+async function smartClick(page, selector, label = '', preferText = '', occurrence = 0) {
+  // Duplicate-ID case: target the Nth match in DOM order (occurrence > 0 means
+  // this is a repeat click on a selector that matches several elements — e.g.
+  // the second `#size` control).
+  let locator;
+  if (occurrence > 0) {
+    const all = page.locator(selector);
+    const count = await all.count().catch(() => 0);
+    locator = count > occurrence ? all.nth(occurrence) : await firstVisible(page, selector, preferText);
+  } else {
+    // WHY firstVisible: many Meesho selectors (e.g. the dropdown search box
+    // `input.MuiInputBase-input.MuiInputBase-inputAdornedStart`, or a generic
+    // `[data-testid="resultRow"]`) match MANY elements — most hidden, and the
+    // visible ones may be several options. We pick the visible match that
+    // contains `preferText` (what the user just typed) when available, else the
+    // first visible one.
+    locator = await firstVisible(page, selector, preferText);
+  }
 
   try {
     await locator.click({ timeout: 8000 });
@@ -390,30 +841,40 @@ async function fillField(page, field, ctx) {
     const sharedDir = path.join(pathDir, 'shared_images');
     const sharedFiles = ['img2.jpg', 'img3.jpg', 'img4.jpg'].map((f) => path.join(sharedDir, f));
 
-    if (imageSlot === 0) {
-      // Hero — the unique per-listing photo.
-      log('info', `🖼  Uploading hero image: ${path.basename(heroImagePath)}`);
-      await page.setInputFiles(field.selector, heroImagePath);
+    // Decide which source this image input uses:
+    //  • field.imageRole === 'hero'   → the per-listing image the user uploads at run time
+    //  • field.imageRole === 'shared' → the 3 pre-uploaded shared images
+    //  • unset / 'auto'               → legacy order: 1st image input = hero, rest = shared
+    const role = field.imageRole && field.imageRole !== 'auto'
+      ? field.imageRole
+      : (imageSlot === 0 ? 'hero' : 'shared');
+
+    // WHY 12s (not the 30s default): a file input that isn't on the page yet
+    // means the preceding "Add images" click didn't reveal it. Fail fast so the
+    // retry/AI/recovery flow kicks in instead of hanging 30s × retries (90s).
+    const SET_FILES_TIMEOUT = 12_000;
+
+    if (role === 'hero') {
+      log('info', `🖼  Uploading hero image (your run-time photo): ${path.basename(heroImagePath)}`);
+      await page.setInputFiles(field.selector, heroImagePath, { timeout: SET_FILES_TIMEOUT });
       return;
     }
 
-    // Non-hero image input. Meesho's "Add more images" input accepts MULTIPLE
-    // files at once. If the path has only one extra image input (the common
-    // case: hero + "add more"), push ALL shared images to it in a single
-    // setInputFiles call — otherwise only img2 would ever upload.
-    if (ctx.imageFieldCount <= 2) {
+    // Shared. Meesho's "Add more images" input accepts MULTIPLE files at once.
+    // For the common hero + single "add more" layout, push ALL shared images in
+    // one setInputFiles call. For multiple discrete shared slots, one per slot.
+    if (ctx.imageFieldCount <= 2 || field.imageRole === 'shared') {
       const present = [];
       for (const f of sharedFiles) {
         try { await fs.access(f); present.push(f); } catch { /* skip missing */ }
       }
       const files = present.length ? present : sharedFiles;
       log('info', `🖼  Uploading ${files.length} shared image(s): ${files.map((f) => path.basename(f)).join(', ')}`);
-      await page.setInputFiles(field.selector, files);
+      await page.setInputFiles(field.selector, files, { timeout: SET_FILES_TIMEOUT });
     } else {
-      // Multiple discrete image slots — one shared image per slot.
       const file = path.join(sharedDir, `img${imageSlot + 1}.jpg`);
       log('info', `🖼  Uploading image #${imageSlot + 1}: ${path.basename(file)}`);
-      await page.setInputFiles(field.selector, file);
+      await page.setInputFiles(field.selector, file, { timeout: SET_FILES_TIMEOUT });
     }
     return;
   }
@@ -428,10 +889,21 @@ async function fillField(page, field, ctx) {
     log('info', `🤖 ${field.fieldName}: ${truncate(value, 60)}`);
   } else {
     value = field.fixedValue ?? '';
-    log('info', `📝 ${field.fieldName}: ${truncate(value, 60)}`);
+    // SECURITY: login credentials come from .env, never from the stored path
+    // config (which no longer holds them). Resolve by the field's selector.
+    const sel = field.selector || '';
+    if (/password/i.test(sel)) {
+      value = process.env.MEESHO_PASSWORD || value;
+    } else if (/emailorphone|email/i.test(sel)) {
+      value = process.env.MEESHO_EMAIL || value;
+    }
+    const shown = isSensitiveField(field) ? '••••••••' : truncate(value, 60);
+    log('info', `📝 ${field.fieldName}: ${shown}`);
   }
 
-  const loc = page.locator(field.selector).first();
+  // Target the first VISIBLE match — Meesho's search/text selectors are often
+  // shared across many hidden inputs; .first() would grab a hidden one.
+  const loc = await firstVisible(page, field.selector);
 
   // WHY: Meesho's GST %, HSN code, and similar fields are React-Select style
   // dropdowns. Their underlying <input> (#supplier_gst_percent, #hsn_code) is
@@ -449,6 +921,12 @@ async function fillField(page, field, ctx) {
   // Editable text input — fill normally with a bounded timeout (not the 30s default).
   await loc.fill('', { timeout: 8000 }).catch(() => {});
   await loc.fill(value, { timeout: 8000 });
+
+  // Remember what was just typed so the NEXT click can prefer the matching
+  // option (search→select pattern). Only meaningful for short search-like text.
+  if (value && String(value).length <= 40) {
+    ctx.lastTypedValue = String(value);
+  }
 }
 
 // How long the recovery overlay waits for the user before giving up.
@@ -575,6 +1053,13 @@ function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
+// Derive the checkbox's visible text from a recorded step label. Labels for
+// checkbox steps are typically the checkbox text itself (e.g. "free size",
+// "I understand that all products…"). Strip a leading "Fill " if present.
+function cleanCheckboxText(label) {
+  return String(label || '').replace(/^Fill\s+/i, '').replace(/\s+/g, ' ').trim();
+}
+
 // ─── URL helpers — used to skip recorded login steps when already logged in ───
 
 /**
@@ -584,6 +1069,27 @@ function truncate(s, n) {
 function isLoginUrl(url) {
   if (!url) return false;
   return /\b(auth|login|signin|signup)\b/i.test(url);
+}
+
+// True for selectors that target a REAL typeable text input — input[…],
+// textarea, or a [name=…] field (e.g. the login input[name="password"]).
+// A fill() on one of these focuses the field itself, so a preceding "focus
+// click" (the brittle recorded login label-clicks) is redundant and skippable.
+// Deliberately EXCLUDES bare #id selectors: Meesho's dropdowns are #control ids
+// whose value is set by the preceding OPTION click (text="Fabric" → #material),
+// and that option click is essential — it must not be treated as skippable, or
+// orphaned dropdowns (no separate open-click) never get selected.
+function isTypeableInputSelector(sel) {
+  if (!sel) return false;
+  return /^(input|textarea)\b/i.test(sel) || /\[name=/i.test(sel);
+}
+
+// True for fields whose value must never be written to the (broadcast + on-disk)
+// run log — passwords above all. Checked against both the field name and the
+// selector so it catches input[name="password"] and "Show Password" labels alike.
+function isSensitiveField(field) {
+  const hay = `${field?.fieldName || ''} ${field?.selector || ''}`.toLowerCase();
+  return /\b(password|passwd|pwd|secret|otp)\b/.test(hay);
 }
 
 /**

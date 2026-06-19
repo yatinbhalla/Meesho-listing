@@ -58,7 +58,7 @@ router.patch('/:name', async (req, res) => {
     const { config, file } = await loadConfig(req.params.name);
 
     // Whitelist of editable top-level keys.
-    const editable = ['name', 'skuPattern', 'productDescription', 'fields'];
+    const editable = ['name', 'skuPattern', 'productDescription', 'fields', 'steps'];
     for (const key of editable) {
       if (key in req.body) config[key] = req.body[key];
     }

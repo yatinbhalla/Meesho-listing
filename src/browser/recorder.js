@@ -27,19 +27,26 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
   const finishPromise = new Promise((r) => { resolveFinish = r; });
 
   // ─── Bridge: browser → Node ──────────────────────────────────────────────────
-  await context.exposeFunction('__recorderEmit', (event) => {
+  // WHY idempotent: getSession() may hand back a REUSED browser context (one a
+  // previous run left open). exposeFunction throws if the name is already bound
+  // on that context, so we swallow "already registered" and move on.
+  async function expose(name, fn) {
+    try { await context.exposeFunction(name, fn); }
+    catch (e) {
+      if (!/already registered|already been registered/i.test(String(e.message))) throw e;
+    }
+  }
+
+  await expose('__recorderEmit', (event) => {
     if (state.paused) return;
     handleEvent(event);
   });
-
-  await context.exposeFunction('__recorderFinish', () => resolveFinish());
-
-  await context.exposeFunction('__recorderPauseToggle', (paused) => {
+  await expose('__recorderFinish', () => resolveFinish());
+  await expose('__recorderPauseToggle', (paused) => {
     state.paused = paused;
     log(paused ? '⏸  Recording paused.' : '▶  Recording resumed.');
   });
-
-  await context.exposeFunction('__recorderClear', () => {
+  await expose('__recorderClear', () => {
     state.steps = [];
     state.fields = [];
     state.seen.clear();
@@ -47,7 +54,7 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
   });
 
   function handleEvent(ev) {
-    const { type, selector, label, value, fieldType } = ev;
+    const { type, selector, label, value, fieldType, kind, checkboxText } = ev;
 
     if (type === 'navigation') {
       // Avoid duplicate consecutive navigation entries.
@@ -63,8 +70,16 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
       // (happens when user clicks the same input multiple times to focus it).
       const last = state.steps[state.steps.length - 1];
       if (last?.action === 'click' && last.selector === selector) return;
-      state.steps.push({ action: 'click', selector, label });
-      log(`👆 Click: ${label}`);
+      const stepObj = { action: 'click', selector, label };
+      // Custom checkbox → tag it so the executor toggles by text (robust),
+      // not by the fragile recorded selector. Covers the size "Free Size" box
+      // and the post-submit "I understand…" declaration checkbox.
+      if (kind === 'checkbox' && checkboxText) {
+        stepObj.kind = 'checkbox';
+        stepObj.checkboxText = checkboxText;
+      }
+      state.steps.push(stepObj);
+      log(kind === 'checkbox' ? `☑ Checkbox: ${label}` : `👆 Click: ${label}`);
       return;
     }
 
@@ -80,18 +95,23 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
     if (type === 'input') {
       // Fields are recorded once. The order matters, so we also push a 'fill'
       // step pointing at the field index — the executor walks steps in order.
+      // SECURITY: never persist login credentials (Meesho email/password). The
+      // executor fills these from .env (MEESHO_EMAIL / MEESHO_PASSWORD) at run
+      // time, so the captured value is dropped — keeping plaintext secrets out
+      // of the path config files.
+      const isCredential = /password|emailorphone/i.test(selector);
       let fieldIndex;
       if (state.seen.has(selector)) {
         fieldIndex = state.fields.findIndex((f) => f.selector === selector);
-        // Update fixedValue in case user retyped
-        if (state.fields[fieldIndex]) state.fields[fieldIndex].fixedValue = value;
+        // Update fixedValue in case user retyped (but never store credentials).
+        if (state.fields[fieldIndex]) state.fields[fieldIndex].fixedValue = isCredential ? '' : value;
       } else {
         fieldIndex = state.fields.length;
         state.fields.push({
           fieldName: label || selector,
           selector,
           type: fieldType || 'fixed',     // user can change in the app later
-          fixedValue: fieldType === 'image' ? '' : value,
+          fixedValue: (fieldType === 'image' || isCredential) ? '' : value,
         });
         state.seen.add(selector);
         state.steps.push({
@@ -129,6 +149,28 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
         return `${tag}[name="${CSS.escape(el.getAttribute('name'))}"]`;
       if (el.getAttribute('aria-label'))
         return `[aria-label="${CSS.escape(el.getAttribute('aria-label'))}"]`;
+
+      // 4b. Checkbox / radio / switch WITHOUT a stable attribute → anchor on the
+      //     associated label's text. WHY: MUI checkboxes are text-less <span>
+      //     wrappers; their class (.MuiCheckbox-root) matches EVERY checkbox on
+      //     the page, so a class selector clicks the wrong one. The label text
+      //     (e.g. "Same as Manufacturer Details") is unique and stable, and
+      //     clicking the <label> toggles its control.
+      const isToggle =
+        /^(checkbox|radio|switch)$/.test(el.getAttribute('role') || '') ||
+        (tag === 'input' && /^(checkbox|radio)$/.test((el.type || '').toLowerCase())) ||
+        /\bMui(Checkbox|Radio|Switch)\b/.test(el.className || '') ||
+        !!(el.closest && el.closest('.MuiCheckbox-root, .MuiRadio-root, .MuiSwitch-root'));
+
+      if (isToggle) {
+        const labelEl = el.closest && el.closest('label, .MuiFormControlLabel-root');
+        const labelText = labelEl
+          ? (labelEl.innerText || '').replace(/\s+/g, ' ').trim()
+          : '';
+        if (labelText && labelText.length >= 2 && labelText.length <= 80) {
+          return `label:has-text("${labelText.replace(/"/g, '\\"')}")`;
+        }
+      }
 
       // --- Visible-text strategies (Playwright text engine) ---------------
       // Use innerText (not textContent) so we capture only what the user sees.
@@ -169,8 +211,10 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
         return `role=${role}[name="${safe}"]`;
       }
 
-      // 6. Visible-text exact match for clickable elements.
-      if (usable && /^(button|a|li|option|label|span|div|td|th)$/.test(tag)) {
+      // 6. Visible-text exact match for clickable elements. Includes <p> because
+      //    Meesho renders some toggles/links as MUI Typography paragraphs
+      //    (e.g. the "Importer Address" row) whose class is non-unique.
+      if (usable && /^(button|a|li|option|label|span|div|td|th|p)$/.test(tag)) {
         const safe = rawText.replace(/"/g, '\\"');
         return `text="${safe}"`;
       }
@@ -282,16 +326,60 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
       return hasText || hasIdentity || isControl;
     }
 
+    // Detect a custom checkbox click (Meesho size/declaration checkboxes are a
+    // styled <svg> next to a text node, or a MUI/role checkbox). Returns the
+    // checkbox's visible text so replay can toggle it by text (robust) rather
+    // than by a fragile positional selector.
+    function detectCheckbox(rawTarget) {
+      let el = rawTarget;
+      for (let i = 0; i < 4 && el && el.tagName; i++) {
+        const tag = el.tagName.toLowerCase();
+        const cls = typeof el.className === 'string' ? el.className : '';
+        const isSvg = tag === 'svg' || tag === 'rect' || tag === 'path';
+        const isCb = (tag === 'input' && (el.getAttribute('type') || '').toLowerCase() === 'checkbox')
+          || el.getAttribute('role') === 'checkbox'
+          || /\bMuiCheckbox-root\b/.test(cls);
+        if (isSvg || isCb) {
+          const row = (el.closest && el.closest('label, li, div')) || el.parentElement || el;
+          const txt = ((row && row.innerText) || '').replace(/\s+/g, ' ').trim();
+          if (txt && txt.length <= 140) return { isCheckbox: true, text: txt };
+        }
+        el = el.parentElement;
+      }
+      return { isCheckbox: false };
+    }
+
     document.addEventListener('click', (e) => {
       if (isInsideOverlay(e.target)) return;
       const el = findClickTarget(e.target);
       if (!isMeaningfulClick(el)) return;
       const selector = getSelector(el);
       if (!selector) return;
-      window.__recorderEmit({ type: 'click', selector, label: getLabel(el) });
+      const ev = { type: 'click', selector, label: getLabel(el) };
+      const cb = detectCheckbox(e.target);
+      if (cb.isCheckbox && cb.text) {
+        ev.kind = 'checkbox';
+        ev.checkboxText = cb.text;
+        ev.label = cb.text.slice(0, 80);
+      }
+      window.__recorderEmit(ev);
     }, true);
 
-    // ── Change capture (selects, checkboxes, file inputs) ──────────────────
+    // Shared helper — capture a text input/textarea's current value as a field.
+    // handleEvent (Node side) dedupes by selector, so calling this from multiple
+    // events (change/blur/input) is safe — it just keeps the latest value.
+    function captureTextValue(el) {
+      if (!el) return;
+      if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return;
+      if (['file', 'checkbox', 'radio', 'submit', 'button'].includes((el.type || '').toLowerCase())) return;
+      const selector = getSelector(el);
+      if (!selector) return;
+      const value = el.value;
+      if (value == null || value === '') return;
+      window.__recorderEmit({ type: 'input', selector, label: getLabel(el), value });
+    }
+
+    // ── Change capture (selects, checkboxes, file inputs, text fields) ─────
     document.addEventListener('change', (e) => {
       if (isInsideOverlay(e.target)) return;
       const el = e.target;
@@ -305,20 +393,24 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
       } else if (el.type === 'file') {
         // File inputs become image fields automatically.
         window.__recorderEmit({ type: 'input', selector, label, value: '', fieldType: 'image' });
+      } else {
+        // Text inputs / textareas — 'change' fires on commit (blur/Enter) and is
+        // more reliable than 'blur' for some MUI-wrapped fields.
+        captureTextValue(el);
       }
     }, true);
 
-    // ── Blur capture (text inputs / textareas) ─────────────────────────────
+    // ── Blur capture (text inputs / textareas) — belt-and-suspenders ───────
     document.addEventListener('blur', (e) => {
       if (isInsideOverlay(e.target)) return;
-      const el = e.target;
-      if (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA') return;
-      if (['file', 'checkbox', 'radio', 'submit', 'button'].includes(el.type)) return;
-      const selector = getSelector(el);
-      if (!selector) return;
-      const value = el.value;
-      if (!value) return;
-      window.__recorderEmit({ type: 'input', selector, label: getLabel(el), value });
+      captureTextValue(e.target);
+    }, true);
+
+    // ── focusout — bubbles, so it fires even when 'blur' (which doesn't bubble)
+    //    is swallowed by a wrapper that stops propagation. Covers MUI fields. ─
+    document.addEventListener('focusout', (e) => {
+      if (isInsideOverlay(e.target)) return;
+      captureTextValue(e.target);
     }, true);
 
     // ── Track navigation ────────────────────────────────────────────────────
@@ -408,7 +500,31 @@ export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
     } else {
       injectPanel();
     }
+
+    // Expose a manual installer so Node can force-inject into an already-loaded
+    // page (reused browser session) where the init script wouldn't re-run.
+    window.__meeshoInstallRecorder = injectPanel;
   });
+
+  // ─── Ensure the overlay is actually present ─────────────────────────────────
+  // WHY: addInitScript only runs on NEW document loads. getSession() may return
+  // a browser a previous run left open and already loaded — the init script
+  // won't fire on it, so the pink panel never appears and nothing is captured.
+  // Navigate to the supplier home for a clean starting point (this triggers the
+  // init script), then verify the panel exists; if not, inject it directly.
+  try {
+    log('Preparing a clean recording window...');
+    await page.goto('https://supplier.meesho.com/panel/v3/new/growth/vaqbo/home', {
+      waitUntil: 'domcontentloaded', timeout: 30_000,
+    });
+    await page.waitForTimeout(1500);
+    const hasPanel = await page.locator('#__meesho_recorder_panel').count().catch(() => 0);
+    if (!hasPanel) {
+      await page.evaluate(() => window.__meeshoInstallRecorder && window.__meeshoInstallRecorder()).catch(() => {});
+    }
+  } catch (e) {
+    log(`Could not auto-open the start page (${e.message}). Navigate to Meesho manually — the recorder is active.`);
+  }
 
   // ─── Wait for user to finish ────────────────────────────────────────────────
   log('Recording started. Walk through Meesho\'s listing form, then click "Save & Finish".');
