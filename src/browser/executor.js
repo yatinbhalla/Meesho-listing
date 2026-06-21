@@ -246,17 +246,20 @@ async function runStepWithRetry(step, stepIndex, ctx, soft = false) {
       ctx.log('success', `🤖 ✓ AI suggested: ${aiResult.selector}${aiResult.reason ? ` — ${aiResult.reason}` : ''}`);
       const aiSelector = aiResult.selector;
 
-      // Try the step once with the AI-suggested selector. If it works, persist it.
+      // Try the step once with the AI-suggested selector — but use it ONLY for
+      // this run; NEVER persist it to the path config. WHY: a transient failure
+      // (slow render, a dynamic MUI id that wasn't ready) could otherwise let AI
+      // overwrite a correct recorded selector with a wrong-but-clickable one
+      // (e.g. clicking the GST dropdown instead of opening the size dialog),
+      // silently and permanently corrupting the path for every future run. We
+      // restore the recorded selector immediately after, so the on-disk config
+      // is left exactly as recorded/edited by the user.
       const prevSelector = step.selector;
       step.selector = aiSelector;
       try {
         await executeStep(step, ctx);
-        // Success — also sync field.selector for fill steps and write to disk.
-        if (step.action === 'fill' && step.fieldRef != null && ctx.pathConfig.fields[step.fieldRef]) {
-          ctx.pathConfig.fields[step.fieldRef].selector = aiSelector;
-        }
-        await persistConfig(ctx.pathConfig, ctx.pathDir);
-        ctx.log('info', '💾 Saved AI-corrected selector to path config.');
+        step.selector = prevSelector;   // keep the recorded selector intact
+        ctx.log('info', '🤖 Rescued this step for the current run only — recorded selector left unchanged.');
         ctx.aiNavCount = (ctx.aiNavCount || 0) + 1;
         return;
       } catch (aiErr) {
@@ -834,6 +837,26 @@ async function clickOptionByText(page, label) {
   return false;
 }
 
+// Read an image file and return a Playwright setInputFiles payload whose name +
+// MIME come from the file's MAGIC BYTES, not its on-disk extension. WHY: shared
+// images are stored as imgN.jpg regardless of their real format, so a PNG saved
+// as img2.jpg would be sent to Meesho as image/jpeg with PNG bytes — a mismatch
+// Meesho rejects, leaving "Add more images" incomplete. Sniffing the true format
+// makes every image upload with the correct type.
+async function toTypedFile(filePath) {
+  const buffer = await fs.readFile(filePath);
+  const base = path.basename(filePath).replace(/\.[^.]+$/, '');
+  let ext = 'jpg', mimeType = 'image/jpeg';
+  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) {
+    ext = 'png'; mimeType = 'image/png';
+  } else if (buffer[0] === 0xff && buffer[1] === 0xd8) {
+    ext = 'jpg'; mimeType = 'image/jpeg';
+  } else if (buffer.length > 12 && buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP') {
+    ext = 'webp'; mimeType = 'image/webp';
+  }
+  return { name: `${base}.${ext}`, mimeType, buffer };
+}
+
 async function fillField(page, field, ctx) {
   const { heroImagePath, pathDir, aiValues, sku, imageSlot, log } = ctx;
 
@@ -856,7 +879,7 @@ async function fillField(page, field, ctx) {
 
     if (role === 'hero') {
       log('info', `🖼  Uploading hero image (your run-time photo): ${path.basename(heroImagePath)}`);
-      await page.setInputFiles(field.selector, heroImagePath, { timeout: SET_FILES_TIMEOUT });
+      await page.setInputFiles(field.selector, await toTypedFile(heroImagePath), { timeout: SET_FILES_TIMEOUT });
       return;
     }
 
@@ -869,12 +892,14 @@ async function fillField(page, field, ctx) {
         try { await fs.access(f); present.push(f); } catch { /* skip missing */ }
       }
       const files = present.length ? present : sharedFiles;
-      log('info', `🖼  Uploading ${files.length} shared image(s): ${files.map((f) => path.basename(f)).join(', ')}`);
-      await page.setInputFiles(field.selector, files, { timeout: SET_FILES_TIMEOUT });
+      const typed = await Promise.all(files.map(toTypedFile));
+      log('info', `🖼  Uploading ${typed.length} shared image(s): ${typed.map((t) => t.name).join(', ')}`);
+      await page.setInputFiles(field.selector, typed, { timeout: SET_FILES_TIMEOUT });
     } else {
       const file = path.join(sharedDir, `img${imageSlot + 1}.jpg`);
-      log('info', `🖼  Uploading image #${imageSlot + 1}: ${path.basename(file)}`);
-      await page.setInputFiles(field.selector, file, { timeout: SET_FILES_TIMEOUT });
+      const typed = await toTypedFile(file);
+      log('info', `🖼  Uploading image #${imageSlot + 1}: ${typed.name}`);
+      await page.setInputFiles(field.selector, typed, { timeout: SET_FILES_TIMEOUT });
     }
     return;
   }
