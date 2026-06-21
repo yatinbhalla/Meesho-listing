@@ -313,9 +313,15 @@ async function executeStep(step, ctx) {
     // Skip clicks on file inputs — they're usually hidden behind a styled
     // button, so clicking fails ("element not visible"). The upload is handled
     // by the subsequent fill step (setInputFiles works on hidden inputs).
-    const isFileInput = await page.locator(step.selector).first()
-      .evaluate((el) => el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'file')
-      .catch(() => false);
+    // PERF: skip this probe entirely for text="…" option selectors — an option
+    // is never a file input, and when its dropdown isn't open yet the locator
+    // matches nothing, making .evaluate() block for the full 30s default timeout
+    // (this alone wasted ~30s on every auto-opened dropdown).
+    const isFileInput = /^text=/.test(step.selector || '')
+      ? false
+      : await page.locator(step.selector).first()
+          .evaluate((el) => el.tagName === 'INPUT' && (el.type || '').toLowerCase() === 'file')
+          .catch(() => false);
     if (isFileInput) {
       ctx.log('info', `↪ ${step.label}: file input — upload handled by the fill step, skipping click.`);
       return;
@@ -468,9 +474,11 @@ function resolveFillField(step, ctx) {
 async function waitForReady(page, step, log) {
   await page.waitForLoadState('domcontentloaded').catch(() => {});
 
-  // Best-effort networkidle — bounded so a long-polling Meesho widget
-  // doesn't stall us forever.
-  await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
+  // NOTE: we deliberately do NOT wait for 'networkidle' here. Meesho's panel is
+  // a single-page app with constant background traffic (analytics, polling), so
+  // networkidle never settles and just burns its full timeout on EVERY step
+  // (~5s × 100+ steps ≈ 9 wasted minutes). The real readiness signal is the
+  // next step's target element being attached, which we wait for below.
 
   if (step.selector && step.action !== 'navigate') {
     // Option-style selectors (text="…") belong to a dropdown that often isn't
