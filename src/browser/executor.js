@@ -441,6 +441,11 @@ function resolveFillField(step, ctx) {
   }
 
   if (f) {
+    // A field can have a blank selector (e.g. reclassified as a field in the
+    // editor, or a recorder gap) — fall back to the STEP's selector, which is
+    // the element actually being acted on. Without this, an image/fill field
+    // with no selector calls setInputFiles('') and crashes.
+    if (!f.selector && step.selector) f = { ...f, selector: step.selector };
     // A matched-but-empty fixed field, when the step carries its own value,
     // should use the step's value (covers older configs that stored value on the step).
     if (f.type === 'fixed' && !f.fixedValue && step.value) {
@@ -549,6 +554,14 @@ async function firstVisible(page, selector, preferText) {
 async function clickCheckboxByText(page, text, log) {
   const target = String(text || '').replace(/\s+/g, ' ').trim();
   if (!target) return false;
+
+  // The checkbox usually lives in a dialog/section that the PRECEDING click just
+  // opened — which may not have rendered yet (especially now that per-step waits
+  // are lean). Give the text a few seconds to appear before tagging, so a
+  // not-yet-rendered checkbox isn't a false miss. If it never appears (e.g. the
+  // open-click didn't actually open the dialog), we fall through and return false.
+  await page.getByText(target, { exact: false }).first()
+    .waitFor({ state: 'visible', timeout: 4000 }).catch(() => {});
 
   // Tag the checkbox element (browser side) so Playwright can click it.
   const found = await page.evaluate((wanted) => {
@@ -1090,7 +1103,14 @@ function truncate(s, n) {
 // checkbox steps are typically the checkbox text itself (e.g. "free size",
 // "I understand that all products…"). Strip a leading "Fill " if present.
 function cleanCheckboxText(label) {
-  return String(label || '').replace(/^Fill\s+/i, '').replace(/\s+/g, ' ').trim();
+  return String(label || '')
+    .replace(/^Fill\s+/i, '')
+    // Strip a trailing recorder annotation like "(size checkbox)" or
+    // "(declaration checkbox)" — it's not part of the on-page text. This makes
+    // the fallback work for recordings that didn't store an explicit checkboxText.
+    .replace(/\s*\([^)]*checkbox[^)]*\)\s*$/i, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 // ─── URL helpers — used to skip recorded login steps when already logged in ───
