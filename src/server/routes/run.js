@@ -6,9 +6,9 @@ import { generateFields, generateSKU } from '../../ai/generator.js';
 import { executeRun } from '../../browser/executor.js';
 import { getSession } from '../../browser/session.js';
 import { broadcast, getActiveSession, setActiveSession, clearActiveSession } from '../index.js';
+import { getActiveProfile, pathsDirFor } from '../profiles.js';
 
 const router = express.Router();
-const PATHS_DIR   = path.resolve('paths');
 const UPLOADS_DIR = path.resolve('data/uploads');
 const MAX_BATCH   = 50;
 
@@ -53,7 +53,10 @@ router.post('/', upload.array('heroImages', MAX_BATCH), async (req, res) => {
       return res.status(400).json({ error: 'At least one heroImages file is required.' });
     }
 
-    const pathDir = path.join(PATHS_DIR, pathName);
+    // Resolve the path under the ACTIVE profile's directory and run with that
+    // account's session + credentials.
+    const profile = getActiveProfile();
+    const pathDir = path.join(path.resolve(pathsDirFor(profile.id)), pathName);
     let pathConfig;
     try {
       const raw = await fs.readFile(path.join(pathDir, 'config.json'), 'utf8');
@@ -68,7 +71,7 @@ router.post('/', upload.array('heroImages', MAX_BATCH), async (req, res) => {
     // ─── Background batch run ───────────────────────────────────────────────
     // Explicit per-run diagnostic flag: fill the form but never click Submit.
     const noSubmit = req.body.noSubmit === 'true' || req.body.noSubmit === true;
-    runBatch({ pathConfig, pathDir, files: req.files, noSubmit })
+    runBatch({ pathConfig, pathDir, files: req.files, noSubmit, profile })
       .catch((err) => {
         broadcast({ type: 'error', topic: 'run', text: err.message });
       })
@@ -90,7 +93,7 @@ router.post('/', upload.array('heroImages', MAX_BATCH), async (req, res) => {
  * Run one batch: open browser once, generate AI once, loop per hero image.
  * Stops on first failure (per the user's chosen policy).
  */
-async function runBatch({ pathConfig, pathDir, files, noSubmit = false }) {
+async function runBatch({ pathConfig, pathDir, files, noSubmit = false, profile = null }) {
   const log = (type, text) => broadcast({ type, text, topic: 'run' });
   const total = files.length;
 
@@ -108,7 +111,9 @@ async function runBatch({ pathConfig, pathDir, files, noSubmit = false }) {
   log('success', `✓ Generated ${Object.keys(aiValues).length} AI field(s).`);
 
   // ─── 2. Open the browser ONCE — reused across all listings ───────────────
-  const { page } = await getSession((m) => log('info', m));
+  log('info', `🔑 Account: ${profile?.name || 'default'}`);
+  const { page } = await getSession((m) => log('info', m), profile);
+  const credentials = { email: profile?.email, password: profile?.password };
 
   // ─── 3. Loop ─────────────────────────────────────────────────────────────
   const succeededSkus = [];
@@ -130,7 +135,7 @@ async function runBatch({ pathConfig, pathDir, files, noSubmit = false }) {
     });
 
     try {
-      await runOneListing({ pathConfig, pathDir, heroImagePath: file.path, aiValues, sku, page, noSubmit });
+      await runOneListing({ pathConfig, pathDir, heroImagePath: file.path, aiValues, sku, page, noSubmit, credentials });
       succeededSkus.push(sku);
       broadcast({
         type: 'event', event: 'batch_item_complete', topic: 'run',
@@ -158,9 +163,9 @@ async function runBatch({ pathConfig, pathDir, files, noSubmit = false }) {
  * Run a single listing in an existing browser session.
  * Wraps executeRun's emitter into a Promise.
  */
-function runOneListing({ pathConfig, pathDir, heroImagePath, aiValues, sku, page, noSubmit }) {
+function runOneListing({ pathConfig, pathDir, heroImagePath, aiValues, sku, page, noSubmit, credentials }) {
   return new Promise((resolve, reject) => {
-    const emitter = executeRun({ pathConfig, heroImagePath, pathDir, aiValues, sku, page, noSubmit });
+    const emitter = executeRun({ pathConfig, heroImagePath, pathDir, aiValues, sku, page, noSubmit, credentials });
     emitter.on('log',   (msg) => broadcast({ ...msg, topic: 'run' }));
     emitter.once('done',  () => resolve());
     emitter.once('error', (err) => reject(err));

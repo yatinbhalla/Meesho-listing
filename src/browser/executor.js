@@ -34,7 +34,7 @@ const READY_TIMEOUT_MS = 15_000;
  *   batch mode in run.js so all listings in a batch share one Chromium window.
  * @returns {EventEmitter}
  */
-export function executeRun({ pathConfig, heroImagePath, pathDir, aiValues = {}, sku = '', page = null, noSubmit = false }) {
+export function executeRun({ pathConfig, heroImagePath, pathDir, aiValues = {}, sku = '', page = null, noSubmit = false, credentials = null }) {
   const emitter = new EventEmitter();
   const log = (type, text) => emitter.emit('log', { type, text });
 
@@ -59,7 +59,7 @@ export function executeRun({ pathConfig, heroImagePath, pathDir, aiValues = {}, 
     // the single "Add more" multi-file input (→ upload all shared images at
     // once) or one of several discrete slots (→ one image each).
     const imageFieldCount = (pathConfig.fields || []).filter((f) => f.type === 'image').length;
-    const ctx = { page: activePage, pathConfig, pathDir, heroImagePath, aiValues, sku, log, imageSlot: 0, imageFieldCount };
+    const ctx = { page: activePage, pathConfig, pathDir, heroImagePath, aiValues, sku, log, imageSlot: 0, imageFieldCount, credentials };
 
     // Tracks whether the steps we're about to replay are part of the recorded
     // login flow. When the persistent profile is already logged in, the browser
@@ -935,13 +935,15 @@ async function fillField(page, field, ctx) {
     log('info', `🤖 ${field.fieldName}: ${truncate(value, 60)}`);
   } else {
     value = field.fixedValue ?? '';
-    // SECURITY: login credentials come from .env, never from the stored path
-    // config (which no longer holds them). Resolve by the field's selector.
+    // SECURITY: login credentials come from the ACTIVE profile (ctx.credentials),
+    // falling back to .env — never from the stored path config (which no longer
+    // holds them). Resolve by the field's selector.
     const sel = field.selector || '';
+    const creds = ctx.credentials || {};
     if (/password/i.test(sel)) {
-      value = process.env.MEESHO_PASSWORD || value;
+      value = creds.password || process.env.MEESHO_PASSWORD || value;
     } else if (/emailorphone|email/i.test(sel)) {
-      value = process.env.MEESHO_EMAIL || value;
+      value = creds.email || process.env.MEESHO_EMAIL || value;
     }
     const shown = isSensitiveField(field) ? '••••••••' : truncate(value, 60);
     log('info', `📝 ${field.fieldName}: ${shown}`);

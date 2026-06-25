@@ -1,20 +1,21 @@
 import { chromium } from 'playwright';
 import path from 'path';
 import fs from 'fs/promises';
+import { sessionDirFor } from '../server/profiles.js';
 
 // WHY: A persistent profile dir means cookies, localStorage, and IndexedDB are
 // all automatically restored on next launch. Far simpler than manually
 // serialising cookies to JSON, and survives Meesho's session token rotation.
-const PROFILE_DIR = path.resolve('data/.browser-profile');
+// Each ACCOUNT (profile) gets its own dir — data/.browser-profile/<profileId> —
+// so the three Meesho logins never overwrite each other.
 const MEESHO_URL  = 'https://supplier.meesho.com/';
 const LOGIN_TIMEOUT_MS = 3 * 60 * 1000;   // 3 minutes for manual fallback
 
 // WHY: Chromium can only have one instance using a given persistent profile
-// dir. We cache the active context so back-to-back runs (or a new run while
-// the previous browser is still open) reuse it instead of crashing on a
-// "profile in use" lock. As a nice side effect, reuse skips the login
-// flow entirely — the user is already authenticated.
-let _activeContext = null;
+// dir. We cache the active context PER PROFILE so back-to-back runs (or a new run
+// while the previous browser is still open) reuse it instead of crashing on a
+// "profile in use" lock. Reuse also skips the login flow — already authenticated.
+const _contexts = new Map();   // profileId -> BrowserContext
 
 /**
  * Heuristic — we consider the user "logged in" once the URL no longer
@@ -94,32 +95,36 @@ async function attemptLogin(page, email, password, log) {
  * @param {(msg: string) => void} [logFn] - Progress callback (default: console.log)
  * @returns {Promise<{ context: import('playwright').BrowserContext, page: import('playwright').Page }>}
  */
-export async function getSession(logFn = console.log) {
+export async function getSession(logFn = console.log, profile = null) {
   const log = logFn;
+  const profileId = profile?.id || 'yatin';
+  const PROFILE_DIR = path.resolve(sessionDirFor(profileId));
 
-  // ─── Reuse an open browser session if there is one ──────────────────────────
+  // ─── Reuse an open browser session for THIS profile if there is one ─────────
   // The page may be on the dashboard, mid-form, or a success screen — the
   // executor's first navigate step handles getting us back to the right URL.
-  if (_activeContext) {
+  const cached = _contexts.get(profileId);
+  if (cached) {
     try {
-      const pages = _activeContext.pages();
-      const reusedPage = pages[0] || await _activeContext.newPage();
+      const pages = cached.pages();
+      const reusedPage = pages[0] || await cached.newPage();
       // Sanity check: if user manually closed the browser, this will throw.
       await reusedPage.evaluate(() => 1);
       log('✓ Reusing open browser session — login skipped.');
       // Bring the window to front so the user can see what's happening.
       await reusedPage.bringToFront().catch(() => {});
-      return { context: _activeContext, page: reusedPage };
+      return { context: cached, page: reusedPage };
     } catch {
       // Stale reference — context or page died. Fall through to a fresh launch.
-      _activeContext = null;
+      _contexts.delete(profileId);
     }
   }
 
-  const email = process.env.MEESHO_EMAIL;
-  const password = process.env.MEESHO_PASSWORD;
+  // Credentials come from the active profile; fall back to .env for safety.
+  const email = profile?.email || process.env.MEESHO_EMAIL;
+  const password = profile?.password || process.env.MEESHO_PASSWORD;
   if (!email || !password) {
-    throw new Error('MEESHO_EMAIL and MEESHO_PASSWORD must be set in .env');
+    throw new Error(`No Meesho email/password set for this account ("${profile?.name || profileId}"). Add them in Settings → Profiles.`);
   }
 
   await fs.mkdir(PROFILE_DIR, { recursive: true });
@@ -145,10 +150,10 @@ export async function getSession(logFn = console.log) {
   }
 
   // Cache for reuse. When the context closes (manual close or closeSession),
-  // null the cache automatically.
-  _activeContext = context;
+  // drop it from the per-profile cache automatically.
+  _contexts.set(profileId, context);
   context.on('close', () => {
-    if (_activeContext === context) _activeContext = null;
+    if (_contexts.get(profileId) === context) _contexts.delete(profileId);
   });
 
   const page = context.pages()[0] || await context.newPage();
@@ -188,6 +193,8 @@ export async function getSession(logFn = console.log) {
  * Close the persistent browser context.
  */
 export async function closeSession({ context }) {
-  if (_activeContext === context) _activeContext = null;
+  for (const [id, ctx] of _contexts) {
+    if (ctx === context) _contexts.delete(id);
+  }
   await context?.close().catch(() => {});
 }

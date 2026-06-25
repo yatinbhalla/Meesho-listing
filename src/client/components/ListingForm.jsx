@@ -5,7 +5,7 @@ import { useWS } from '../App.jsx';
 // Daily-use screen: pick a path → upload N hero images → click Run.
 // Each image becomes its own listing; everything else (description, AI text,
 // shared images 2-4) is reused across the batch.
-export default function ListingForm({ path, onRefresh, onEdit }) {
+export default function ListingForm({ path, onRefresh, onEdit, activeProfileName }) {
   const [heroFiles, setHeroFiles]   = useState([]);     // File[]
   const [previews, setPreviews]     = useState([]);     // dataURL[]
   const [running, setRunning]       = useState(false);
@@ -223,6 +223,12 @@ export default function ListingForm({ path, onRefresh, onEdit }) {
           </div>
         )}
       </div>
+
+      {activeProfileName && (
+        <p className="text-center text-sm text-gray-500 mb-2">
+          Uploading to account: <span className="font-semibold text-meesho-dark">{activeProfileName}</span>
+        </p>
+      )}
 
       <button
         onClick={onRun}

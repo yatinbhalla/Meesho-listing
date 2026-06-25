@@ -2,17 +2,24 @@ import express from 'express';
 import fs from 'fs/promises';
 import path from 'path';
 import multer from 'multer';
+import { getActiveProfile, pathsDirFor } from '../profiles.js';
 
 const router = express.Router();
-const PATHS_DIR = path.resolve('paths');
+
+// Paths are scoped to the active profile (account): paths/<profileId>/recording_*.
+// Resolved per-request so switching accounts immediately changes which paths the
+// API lists, runs, and edits.
+function pathsDir() {
+  return path.resolve(pathsDirFor(getActiveProfile().id));
+}
 
 async function ensurePathsDir() {
-  await fs.mkdir(PATHS_DIR, { recursive: true });
+  await fs.mkdir(pathsDir(), { recursive: true });
 }
 
 // Helper: resolve a path's config.json by directory name (= safeName).
 async function loadConfig(name) {
-  const file = path.join(PATHS_DIR, name, 'config.json');
+  const file = path.join(pathsDir(), name, 'config.json');
   const raw = await fs.readFile(file, 'utf8');
   return { config: JSON.parse(raw), file };
 }
@@ -20,12 +27,12 @@ async function loadConfig(name) {
 // ─── GET /api/paths — list all saved paths ────────────────────────────────────
 router.get('/', async (_req, res) => {
   await ensurePathsDir();
-  const entries = await fs.readdir(PATHS_DIR, { withFileTypes: true });
+  const entries = await fs.readdir(pathsDir(), { withFileTypes: true });
   const configs = [];
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     try {
-      const raw = await fs.readFile(path.join(PATHS_DIR, entry.name, 'config.json'), 'utf8');
+      const raw = await fs.readFile(path.join(pathsDir(), entry.name, 'config.json'), 'utf8');
       const config = JSON.parse(raw);
       // Tag with the folder name so the UI can use it for subsequent calls.
       config._folder = entry.name;
@@ -82,7 +89,7 @@ router.post('/:name/duplicate', async (req, res) => {
     const { config } = await loadConfig(req.params.name);
 
     const newFolder = `recording_${Date.now()}`;
-    const newDir = path.join(PATHS_DIR, newFolder);
+    const newDir = path.join(pathsDir(), newFolder);
     await fs.mkdir(newDir, { recursive: true });
 
     const now = new Date().toISOString();
@@ -95,7 +102,7 @@ router.post('/:name/duplicate', async (req, res) => {
     // Copy shared images too, so the clone can run without re-uploading them.
     try {
       await fs.cp(
-        path.join(PATHS_DIR, req.params.name, 'shared_images'),
+        path.join(pathsDir(), req.params.name, 'shared_images'),
         path.join(newDir, 'shared_images'),
         { recursive: true },
       );
@@ -126,7 +133,7 @@ router.get('/:name/export', async (req, res) => {
 
     // Bundle the shared images so a restore needs nothing else.
     const images = {};
-    const imgDir = path.join(PATHS_DIR, req.params.name, 'shared_images');
+    const imgDir = path.join(pathsDir(), req.params.name, 'shared_images');
     try {
       for (const file of await fs.readdir(imgDir)) {
         if (/\.(jpe?g|png|webp)$/i.test(file)) {
@@ -169,7 +176,7 @@ router.post('/import', backupUpload.single('backup'), async (req, res) => {
     }
 
     const newFolder = `recording_${Date.now()}`;
-    const newDir = path.join(PATHS_DIR, newFolder);
+    const newDir = path.join(pathsDir(), newFolder);
     await fs.mkdir(newDir, { recursive: true });
 
     const now = new Date().toISOString();
@@ -205,7 +212,7 @@ router.post('/import', backupUpload.single('backup'), async (req, res) => {
 // ─── DELETE /api/paths/:name ──────────────────────────────────────────────────
 router.delete('/:name', async (req, res) => {
   try {
-    await fs.rm(path.join(PATHS_DIR, req.params.name), { recursive: true, force: true });
+    await fs.rm(path.join(pathsDir(), req.params.name), { recursive: true, force: true });
     res.json({ ok: true });
   } catch {
     res.status(500).json({ error: 'Could not delete path.' });
@@ -218,7 +225,7 @@ router.delete('/:name', async (req, res) => {
 const sharedUpload = multer({
   storage: multer.diskStorage({
     destination: async (req, _file, cb) => {
-      const dir = path.join(PATHS_DIR, req.params.name, 'shared_images');
+      const dir = path.join(pathsDir(), req.params.name, 'shared_images');
       await fs.mkdir(dir, { recursive: true });
       cb(null, dir);
     },
@@ -241,7 +248,7 @@ router.post(
   ]),
   async (req, res) => {
     try {
-      const dir = path.join(PATHS_DIR, req.params.name, 'shared_images');
+      const dir = path.join(pathsDir(), req.params.name, 'shared_images');
       const required = ['img2', 'img3', 'img4'];
       for (const slot of required) {
         if (!req.files?.[slot]?.[0]) {
@@ -267,7 +274,7 @@ router.post(
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 async function sharedImagesPresent(name) {
-  const dir = path.join(PATHS_DIR, name, 'shared_images');
+  const dir = path.join(pathsDir(), name, 'shared_images');
   try {
     const files = await fs.readdir(dir);
     return ['img2.jpg', 'img3.jpg', 'img4.jpg'].every((f) => files.includes(f));

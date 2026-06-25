@@ -1,6 +1,7 @@
 import express from 'express';
 import { recordPath } from '../../browser/recorder.js';
 import { broadcast, getActiveSession, setActiveSession, clearActiveSession } from '../index.js';
+import { getActiveProfile } from '../profiles.js';
 
 const router = express.Router();
 
@@ -25,7 +26,7 @@ router.post('/', async (_req, res) => {
   // WHY: We don't await this — recording can take 5-15 minutes while the user
   // walks through the form. The HTTP response is already sent; progress flows
   // via WebSocket only.
-  recordPath((type, text) => broadcast({ type, text, topic: 'record' }))
+  recordPath((type, text) => broadcast({ type, text, topic: 'record' }), getActiveProfile())
     .then(({ pathConfig }) => {
       broadcast({
         type: 'event',

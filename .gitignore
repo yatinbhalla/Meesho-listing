@@ -4,6 +4,7 @@
 data/cookies.json
 data/.browser-profile/
 data/uploads/
+data/profiles.json
 
 # ─── Private business data ─────────────────────────────────────────────────────
 # Recorded paths contain product descriptions, manufacturer details, MRPs etc.

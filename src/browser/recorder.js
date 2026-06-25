@@ -1,8 +1,7 @@
 import { getSession, closeSession } from './session.js';
+import { pathsDirFor } from '../server/profiles.js';
 import fs from 'fs/promises';
 import path from 'path';
-
-const PATHS_DIR = path.resolve('paths');
 
 /**
  * Open Meesho with a recording overlay; capture every interaction and return
@@ -11,9 +10,12 @@ const PATHS_DIR = path.resolve('paths');
  * @param {(type: string, text: string) => void} [logFn]
  * @returns {Promise<{ pathConfig: import('../types/models.js').PathConfig, savedTo: string }>}
  */
-export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`)) {
+export async function recordPath(logFn = (t, m) => console.log(`[${t}] ${m}`), profile = null) {
   const log = (text, type = 'info') => logFn(type, text);
-  const { context, page } = await getSession((m) => log(m));
+  // Record in the ACTIVE account's browser session and save the path under that
+  // account's directory: paths/<profileId>/recording_*.
+  const PATHS_DIR = path.resolve(pathsDirFor(profile?.id || 'yatin'));
+  const { context, page } = await getSession((m) => log(m), profile);
 
   // ─── State (lives in Node, not the browser) ─────────────────────────────────
   const state = {

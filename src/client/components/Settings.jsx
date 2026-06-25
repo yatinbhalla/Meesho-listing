@@ -1,14 +1,15 @@
 import React, { useEffect, useState } from 'react';
 
-export default function Settings({ paths, onPathsChanged, onEditPath, onDuplicatePath }) {
-  const [tab, setTab] = useState('credentials');
+export default function Settings({ paths, onPathsChanged, onEditPath, onDuplicatePath, onProfilesChanged }) {
+  const [tab, setTab] = useState('profiles');
   return (
     <div className="max-w-3xl mx-auto p-6 space-y-6">
       <h2 className="text-2xl font-bold">Settings</h2>
 
       <div className="flex gap-1 border-b border-gray-200">
         {[
-          { id: 'credentials', label: 'Credentials' },
+          { id: 'profiles',    label: 'Accounts' },
+          { id: 'credentials', label: 'Gemini & AI' },
           { id: 'paths',       label: 'Paths' },
           { id: 'skus',        label: 'Used SKUs' },
         ].map((t) => (
@@ -22,9 +23,88 @@ export default function Settings({ paths, onPathsChanged, onEditPath, onDuplicat
         ))}
       </div>
 
+      {tab === 'profiles'    && <ProfilesTab onProfilesChanged={onProfilesChanged} />}
       {tab === 'credentials' && <CredentialsTab />}
       {tab === 'paths'       && <PathsTab paths={paths} onPathsChanged={onPathsChanged} onEditPath={onEditPath} onDuplicatePath={onDuplicatePath} />}
       {tab === 'skus'        && <SkusTab />}
+    </div>
+  );
+}
+
+// ─── Accounts (Meesho profiles) ─────────────────────────────────────────────────
+function ProfilesTab({ onProfilesChanged }) {
+  const [profiles, setProfiles] = useState(null);
+  const [drafts, setDrafts]     = useState({});   // id -> { name, email, password }
+  const [savingId, setSavingId] = useState(null);
+  const [msg, setMsg]           = useState(null);
+
+  const load = () => fetch('/api/profiles').then((r) => r.json()).then((d) => {
+    setProfiles(d.profiles);
+    setDrafts(Object.fromEntries(d.profiles.map((p) => [p.id, { name: p.name, email: p.email, password: '' }])));
+  }).catch(() => {});
+
+  useEffect(() => { load(); }, []);
+
+  function setField(id, key, val) {
+    setDrafts((d) => ({ ...d, [id]: { ...d[id], [key]: val } }));
+  }
+
+  async function save(p) {
+    setSavingId(p.id); setMsg(null);
+    try {
+      const body = {};
+      const d = drafts[p.id] || {};
+      if (d.name !== p.name)   body.name = d.name;
+      if (d.email !== p.email) body.email = d.email;
+      if (d.password)          body.password = d.password;
+      if (Object.keys(body).length === 0) { setMsg({ type: 'info', text: 'Nothing to update.' }); return; }
+      const res = await fetch(`/api/profiles/${p.id}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || 'Save failed.'); }
+      setMsg({ type: 'success', text: `Saved "${d.name}". Applies on the next run for this account.` });
+      await load();
+      onProfilesChanged?.();
+    } catch (err) {
+      setMsg({ type: 'error', text: err.message });
+    } finally { setSavingId(null); }
+  }
+
+  if (!profiles) return <p className="text-gray-400 text-sm">Loading…</p>;
+
+  return (
+    <div className="space-y-4">
+      <p className="text-xs text-gray-500">
+        Each account has its own Meesho login, its own saved paths, and its own browser session. Switch the active
+        account from the sidebar. Credentials are stored locally in <code className="bg-gray-100 px-1 rounded">data/profiles.json</code> and never sent anywhere except to Meesho.
+      </p>
+      {profiles.map((p) => {
+        const d = drafts[p.id] || { name: '', email: '', password: '' };
+        return (
+          <div key={p.id} className="bg-white rounded-xl border border-gray-200 p-5 space-y-3">
+            <div className="flex items-center gap-2">
+              <span className="text-lg">👤</span>
+              <input
+                value={d.name}
+                onChange={(e) => setField(p.id, 'name', e.target.value)}
+                className="text-base font-semibold border-b border-transparent hover:border-gray-300 focus:border-meesho-pink focus:outline-none flex-1"
+              />
+            </div>
+            <Field label="Meesho Email" value={d.email} onChange={(v) => setField(p.id, 'email', v)} placeholder="account email" />
+            <Field label="Meesho Password" type="password"
+              placeholder={p.hasPassword ? `Current: ${p.passwordMasked}` : 'Not set'}
+              value={d.password} onChange={(v) => setField(p.id, 'password', v)}
+              hint="Leave blank to keep the existing password." />
+            <button
+              onClick={() => save(p)} disabled={savingId === p.id}
+              className="px-4 py-2 bg-meesho-pink text-white rounded-lg text-sm font-medium hover:bg-meesho-dark transition-colors disabled:bg-gray-300"
+            >{savingId === p.id ? 'Saving…' : 'Save account'}</button>
+          </div>
+        );
+      })}
+      {msg && (
+        <p className={`text-sm ${msg.type === 'error' ? 'text-red-600' : msg.type === 'success' ? 'text-green-600' : 'text-gray-600'}`}>{msg.text}</p>
+      )}
     </div>
   );
 }
@@ -51,9 +131,7 @@ function CredentialsTab() {
     setSaving(true); setMsg(null);
     try {
       const body = {};
-      // Only send non-empty fields. Password / API key blank = keep existing.
-      if (form.MEESHO_EMAIL    !== data?.MEESHO_EMAIL)  body.MEESHO_EMAIL = form.MEESHO_EMAIL;
-      if (form.MEESHO_PASSWORD)                          body.MEESHO_PASSWORD = form.MEESHO_PASSWORD;
+      // Only send non-empty fields. API key blank = keep existing.
       if (form.GEMINI_API_KEY)                           body.GEMINI_API_KEY  = form.GEMINI_API_KEY;
       if (form.GEMINI_MODEL    !== data?.GEMINI_MODEL)  body.GEMINI_MODEL    = form.GEMINI_MODEL;
       if (form.AI_NAVIGATION_ENABLED !== data?.AI_NAVIGATION_ENABLED) {
@@ -86,15 +164,9 @@ function CredentialsTab() {
   return (
     <div className="bg-white rounded-xl border border-gray-200 p-6 space-y-4">
       <p className="text-xs text-gray-500">
-        Stored locally in <code className="bg-gray-100 px-1 rounded">.env</code>. Never sent anywhere except to Meesho (login) and Gemini (text generation).
+        Gemini powers AI text generation &amp; navigation. Stored locally in <code className="bg-gray-100 px-1 rounded">.env</code>.
+        Meesho account logins live under the <strong>Accounts</strong> tab.
       </p>
-
-      <Field label="Meesho Email" value={form.MEESHO_EMAIL}
-        onChange={(v) => setForm({ ...form, MEESHO_EMAIL: v })} />
-
-      <Field label="Meesho Password" type="password" placeholder={data.hasPassword ? `Current: ${data.MEESHO_PASSWORD_MASKED}` : 'Not set'}
-        value={form.MEESHO_PASSWORD} onChange={(v) => setForm({ ...form, MEESHO_PASSWORD: v })}
-        hint="Leave blank to keep existing password." />
 
       <Field label="Gemini API Key" type="password" placeholder={data.hasApiKey ? `Current: ${data.GEMINI_API_KEY_MASKED}` : 'Not set'}
         value={form.GEMINI_API_KEY} onChange={(v) => setForm({ ...form, GEMINI_API_KEY: v })}

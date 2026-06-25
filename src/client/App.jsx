@@ -18,6 +18,8 @@ export default function App() {
   const [selectedPath, setSelectedPath]   = useState(null);
   const [configuringPath, setConfiguringPath] = useState(null);    // PathConfig used by the post-record wizard
   const [editingPath, setEditingPath]     = useState(null);        // PathConfig used to edit an existing path
+  const [profiles, setProfiles]           = useState([]);          // the Meesho accounts
+  const [activeProfileId, setActiveProfileId] = useState(null);
 
   const refreshPaths = useCallback(async () => {
     try {
@@ -25,6 +27,37 @@ export default function App() {
       if (res.ok) setPaths(await res.json());
     } catch {}
   }, []);
+
+  const refreshProfiles = useCallback(async () => {
+    try {
+      const res = await fetch('/api/profiles');
+      if (res.ok) {
+        const data = await res.json();
+        setProfiles(data.profiles);
+        setActiveProfileId(data.activeProfileId);
+      }
+    } catch {}
+  }, []);
+
+  // Switch the active Meesho account. Paths are server-scoped to the active
+  // profile, so we just re-fetch and reset the selection/view.
+  const switchProfile = useCallback(async (id) => {
+    try {
+      const res = await fetch('/api/profiles/active', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id }),
+      });
+      if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || 'Could not switch account.'); }
+      setActiveProfileId(id);
+      setSelectedPath(null);
+      await refreshPaths();
+      setView('welcome');
+    } catch (err) {
+      alert(err.message);
+    }
+  }, [refreshPaths]);
+
+  const activeProfile = profiles.find((p) => p.id === activeProfileId) || null;
 
   // Open the CONFIGURE screen for a path (re-fetches latest config to avoid stale state).
   // Used after recording and when the user clicks an unconfigured path in the sidebar.
@@ -82,7 +115,7 @@ export default function App() {
     else setView('list');
   }
 
-  useEffect(() => { refreshPaths(); }, [refreshPaths]);
+  useEffect(() => { refreshPaths(); refreshProfiles(); }, [refreshPaths, refreshProfiles]);
 
   // ─── WebSocket — central connection shared via context ─────────────────────
   const ws = useWebSocket((msg) => {
@@ -134,6 +167,9 @@ export default function App() {
           onSelectPath={handleSelectPath}
           onNewPath={() => setView('record')}
           onSettings={() => setView('settings')}
+          profiles={profiles}
+          activeProfileId={activeProfileId}
+          onSwitchProfile={switchProfile}
         />
 
         <main className="flex-1 overflow-y-auto">
@@ -143,6 +179,7 @@ export default function App() {
               path={selectedPath}
               onRefresh={refreshPaths}
               onEdit={() => openEditor(selectedPath)}
+              activeProfileName={activeProfile?.name}
             />
           )}
           {view === 'record'  && <RecordWizard onCancel={() => setView('welcome')} />}
@@ -182,6 +219,7 @@ export default function App() {
               paths={paths}
               onEditPath={openEditor}
               onDuplicatePath={duplicatePath}
+              onProfilesChanged={refreshProfiles}
             />
           )}
         </main>
