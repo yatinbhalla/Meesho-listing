@@ -103,6 +103,17 @@ export function executeRun({ pathConfig, heroImagePath, pathDir, aiValues = {}, 
         continue;
       }
 
+      // ─── Skip navigations to non-Meesho domains (tracking pixels) ─────────
+      // Meesho fires analytics/marketing pixels (facebook.com/tr, google, etc.)
+      // during a real session; the recorder sometimes captures one as a navigate
+      // step. Replaying it would drive the browser AWAY from Meesho mid-flow and
+      // break everything. The automation only ever navigates within Meesho.
+      if (step.action === 'navigate' && /^https?:\/\//i.test(step.value || '') && !/(^|\.)meesho\.com/i.test(new URL(step.value).hostname)) {
+        log('info', `${progress} ⏭  Skipping navigate to non-Meesho URL (${new URL(step.value).hostname} — tracking pixel).`);
+        skipped++;
+        continue;
+      }
+
       // ─── Skip-login-when-already-logged-in ────────────────────────────────
       if (step.action === 'navigate') {
         // WHY: we no longer skip the navigate-to-login step based on the URL
@@ -306,8 +317,15 @@ async function executeStep(step, ctx) {
       const cbText = step.checkboxText || cleanCheckboxText(step.label);
       const ok = await clickCheckboxByText(page, cbText, ctx.log);
       if (ok) return;
-      ctx.log('info', `☐ Could not resolve checkbox "${truncate(cbText, 50)}" by text — falling back to its selector.`);
-      // fall through to the normal click ladder with the recorded selector
+      // OPTIONAL by design: some checkboxes only appear CONDITIONALLY — most
+      // notably the post-submit "I understand… not branded/illegal" declaration,
+      // which Meesho shows only for certain catalog content. clickCheckboxByText
+      // already waited a few seconds for the text. If it still isn't on the page,
+      // the checkbox simply isn't being asked for this time, so we SKIP it rather
+      // than retry a brittle selector → AI nav → manual recovery (which hangs the
+      // run). "Checkbox present → tick it; checkbox absent → skip it."
+      ctx.log('info', `☐ Checkbox "${truncate(cbText, 50)}" not shown this time — skipping (optional).`);
+      return;
     }
 
     // Skip clicks on file inputs — they're usually hidden behind a styled
