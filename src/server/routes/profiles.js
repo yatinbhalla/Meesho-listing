@@ -10,7 +10,7 @@ function mask(value) {
   return value.slice(0, 4) + '••••' + value.slice(-2);
 }
 
-// Never leak full passwords to the client.
+// Never leak full passwords / API keys to the client.
 function publicProfile(p) {
   return {
     id: p.id,
@@ -18,6 +18,8 @@ function publicProfile(p) {
     email: p.email || '',
     hasPassword: !!p.password,
     passwordMasked: mask(p.password),
+    hasGeminiKey: !!p.geminiApiKey,
+    geminiKeyMasked: mask(p.geminiApiKey),
   };
 }
 

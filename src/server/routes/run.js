@@ -107,6 +107,7 @@ async function runBatch({ pathConfig, pathDir, files, noSubmit = false, profile 
     pathConfig.fields,
     pathConfig.productDescription,
     (m) => log('info', m),
+    profile?.geminiApiKey,
   );
   log('success', `✓ Generated ${Object.keys(aiValues).length} AI field(s).`);
 

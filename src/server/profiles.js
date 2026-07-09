@@ -17,10 +17,12 @@ const PATHS_ROOT    = path.resolve('paths');
 const BROWSER_ROOT  = path.resolve('data/.browser-profile');
 
 // The 3 accounts the user runs. Ids are stable internal keys; names are display-only.
+// Each account can have its OWN Gemini API key so one account's rate limit never
+// affects another; falls back to the global .env GEMINI_API_KEY when blank.
 const SEED = [
-  { id: 'yatin', name: 'Yatin Bhalla', email: '', password: '' },
-  { id: 'param', name: 'param',        email: '', password: '' },
-  { id: 'dayal', name: 'dayal',        email: '', password: '' },
+  { id: 'yatin', name: 'Yatin Bhalla', email: '', password: '', geminiApiKey: '' },
+  { id: 'param', name: 'param',        email: '', password: '', geminiApiKey: '' },
+  { id: 'dayal', name: 'dayal',        email: '', password: '', geminiApiKey: '' },
 ];
 
 let _state = null;   // { activeProfileId, profiles: [...] }
@@ -48,6 +50,17 @@ export async function ensureProfilesInit() {
       if (!_state.profiles.find((p) => p.id === s.id)) _state.profiles.push({ ...s });
     }
     if (!_state.activeProfileId) _state.activeProfileId = _state.profiles[0].id;
+    // Backfill the geminiApiKey field on older profiles.json — seed Yatin's from
+    // the existing global .env key so nothing breaks.
+    let touched = false;
+    for (const p of _state.profiles) {
+      if (p.geminiApiKey === undefined) { p.geminiApiKey = ''; touched = true; }
+    }
+    const yatin = _state.profiles.find((p) => p.id === 'yatin');
+    if (yatin && !yatin.geminiApiKey && process.env.GEMINI_API_KEY) {
+      yatin.geminiApiKey = process.env.GEMINI_API_KEY; touched = true;
+    }
+    if (touched) await save();
     return _state;
   } catch {
     // First run — create + migrate the existing single-account setup into "yatin".
@@ -57,7 +70,7 @@ export async function ensureProfilesInit() {
     activeProfileId: 'yatin',
     profiles: SEED.map((p) =>
       p.id === 'yatin'
-        ? { ...p, email: process.env.MEESHO_EMAIL || '', password: process.env.MEESHO_PASSWORD || '' }
+        ? { ...p, email: process.env.MEESHO_EMAIL || '', password: process.env.MEESHO_PASSWORD || '', geminiApiKey: process.env.GEMINI_API_KEY || '' }
         : { ...p }
     ),
   };
@@ -124,12 +137,13 @@ export async function setActiveProfile(id) {
   return getActiveProfile();
 }
 
-export async function updateProfile(id, { name, email, password }) {
+export async function updateProfile(id, { name, email, password, geminiApiKey }) {
   const p = getProfiles().find((x) => x.id === id);
   if (!p) throw new Error(`Unknown profile "${id}".`);
   if (name != null && name !== '')     p.name = String(name);
   if (email != null)                    p.email = String(email);
-  if (password)                         p.password = String(password);   // blank = keep existing
+  if (password)                         p.password = String(password);       // blank = keep existing
+  if (geminiApiKey)                     p.geminiApiKey = String(geminiApiKey); // blank = keep existing
   await save();
   return p;
 }

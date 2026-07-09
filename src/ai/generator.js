@@ -51,7 +51,7 @@ Rules:
  * @param {(msg: string) => void} [logFn]   - optional progress callback
  * @returns {Promise<Record<string, string>>}
  */
-export async function generateFields(fields, productDescription, logFn) {
+export async function generateFields(fields, productDescription, logFn, apiKey) {
   const aiFields = fields.filter((f) => f.type === 'ai');
   if (aiFields.length === 0) return {};
 
@@ -60,7 +60,7 @@ export async function generateFields(fields, productDescription, logFn) {
   }
 
   const prompt = buildPrompt(aiFields, productDescription);
-  const parsed = await callGeminiJSON(prompt, { temperature: 0.7, log: logFn });
+  const parsed = await callGeminiJSON(prompt, { temperature: 0.7, log: logFn, apiKey });
 
   const missing = aiFields.filter((f) => !(f.fieldName in parsed));
   if (missing.length > 0) {

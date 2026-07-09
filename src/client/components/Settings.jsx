@@ -40,7 +40,7 @@ function ProfilesTab({ onProfilesChanged }) {
 
   const load = () => fetch('/api/profiles').then((r) => r.json()).then((d) => {
     setProfiles(d.profiles);
-    setDrafts(Object.fromEntries(d.profiles.map((p) => [p.id, { name: p.name, email: p.email, password: '' }])));
+    setDrafts(Object.fromEntries(d.profiles.map((p) => [p.id, { name: p.name, email: p.email, password: '', geminiApiKey: '' }])));
   }).catch(() => {});
 
   useEffect(() => { load(); }, []);
@@ -57,6 +57,7 @@ function ProfilesTab({ onProfilesChanged }) {
       if (d.name !== p.name)   body.name = d.name;
       if (d.email !== p.email) body.email = d.email;
       if (d.password)          body.password = d.password;
+      if (d.geminiApiKey)      body.geminiApiKey = d.geminiApiKey;
       if (Object.keys(body).length === 0) { setMsg({ type: 'info', text: 'Nothing to update.' }); return; }
       const res = await fetch(`/api/profiles/${p.id}`, {
         method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
@@ -75,11 +76,12 @@ function ProfilesTab({ onProfilesChanged }) {
   return (
     <div className="space-y-4">
       <p className="text-xs text-gray-500">
-        Each account has its own Meesho login, its own saved paths, and its own browser session. Switch the active
-        account from the sidebar. Credentials are stored locally in <code className="bg-gray-100 px-1 rounded">data/profiles.json</code> and never sent anywhere except to Meesho.
+        Each account has its own Meesho login, its own saved paths, its own browser session, and its own Gemini API key
+        (so one account's quota never affects another). Switch the active account from the sidebar. Credentials are stored
+        locally in <code className="bg-gray-100 px-1 rounded">data/profiles.json</code> and never sent anywhere except to Meesho and Gemini.
       </p>
       {profiles.map((p) => {
-        const d = drafts[p.id] || { name: '', email: '', password: '' };
+        const d = drafts[p.id] || { name: '', email: '', password: '', geminiApiKey: '' };
         return (
           <div key={p.id} className="bg-white rounded-xl border border-gray-200 p-5 space-y-3">
             <div className="flex items-center gap-2">
@@ -95,6 +97,10 @@ function ProfilesTab({ onProfilesChanged }) {
               placeholder={p.hasPassword ? `Current: ${p.passwordMasked}` : 'Not set'}
               value={d.password} onChange={(v) => setField(p.id, 'password', v)}
               hint="Leave blank to keep the existing password." />
+            <Field label="Gemini API Key" type="password"
+              placeholder={p.hasGeminiKey ? `Current: ${p.geminiKeyMasked}` : 'Not set — uses the global .env key'}
+              value={d.geminiApiKey} onChange={(v) => setField(p.id, 'geminiApiKey', v)}
+              hint="This account's own Gemini key (separate quota). Leave blank to keep existing / use the global key." />
             <button
               onClick={() => save(p)} disabled={savingId === p.id}
               className="px-4 py-2 bg-meesho-pink text-white rounded-lg text-sm font-medium hover:bg-meesho-dark transition-colors disabled:bg-gray-300"
@@ -164,8 +170,8 @@ function CredentialsTab() {
   return (
     <div className="bg-white rounded-xl border border-gray-200 p-6 space-y-4">
       <p className="text-xs text-gray-500">
-        Gemini powers AI text generation &amp; navigation. Stored locally in <code className="bg-gray-100 px-1 rounded">.env</code>.
-        Meesho account logins live under the <strong>Accounts</strong> tab.
+        Gemini powers AI text generation &amp; navigation. This is the <strong>global fallback</strong> key — an account
+        with its own Gemini key (under the <strong>Accounts</strong> tab) uses that instead. Stored locally in <code className="bg-gray-100 px-1 rounded">.env</code>.
       </p>
 
       <Field label="Gemini API Key" type="password" placeholder={data.hasApiKey ? `Current: ${data.GEMINI_API_KEY_MASKED}` : 'Not set'}

@@ -15,17 +15,20 @@ const MODEL_FALLBACK = [
 
 const MAX_RETRIES = 2;
 
-let _client = null;
+const _clients = new Map();   // apiKey -> GoogleGenerativeAI (one per account key)
 let _workingModel = null;     // cached after first successful call
 
-function getClient() {
-  if (_client) return _client;
-  const key = process.env.GEMINI_API_KEY;
+// Resolve the API key: the active account's key (passed in) takes precedence,
+// falling back to the global .env GEMINI_API_KEY.
+function getClient(apiKey) {
+  const key = apiKey || process.env.GEMINI_API_KEY;
   if (!key || key === 'your_gemini_api_key_here') {
-    throw new Error('GEMINI_API_KEY is missing from .env. Get one at https://aistudio.google.com/app/apikey');
+    throw new Error('No Gemini API key set for this account. Add one in Settings → Accounts (or a global key in .env). Get one at https://aistudio.google.com/app/apikey');
   }
-  _client = new GoogleGenerativeAI(key);
-  return _client;
+  if (_clients.has(key)) return _clients.get(key);
+  const client = new GoogleGenerativeAI(key);
+  _clients.set(key, client);
+  return client;
 }
 
 /**
@@ -40,7 +43,7 @@ function getClient() {
  */
 export async function callGeminiJSON(prompt, opts = {}) {
   const log = (m) => opts.log ? opts.log(m) : null;
-  const client = getClient();
+  const client = getClient(opts.apiKey);
 
   // Build candidate list: cached winner first, then user override, then fallback chain.
   const userOverride = process.env.GEMINI_MODEL;
