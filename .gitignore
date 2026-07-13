@@ -13,6 +13,18 @@ paths/*
 !paths/.gitkeep
 data/used_skus.json
 
+# ─── Image generation (background swap) ────────────────────────────────────────
+# (inline comments are NOT allowed on pattern lines — git treats them as part of
+#  the pattern — so each note goes on its own line above the pattern.)
+# ephemeral per-batch composites
+data/generated/
+# remote-downloaded Transformers.js model cache
+data/.models/
+# locally-staged RMBG-1.4 model (large binary)
+data/.models-local/
+# all background plates + scenes (procedurally generated, self-heal on run)
+assets/
+
 # ─── Dependencies ───────────────────────────────────────────────────────────────
 node_modules/
 

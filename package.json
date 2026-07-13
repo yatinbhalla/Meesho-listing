@@ -8,10 +8,12 @@
     "server": "node src/server/index.js",
     "client": "vite",
     "build": "vite build",
+    "gen:assets": "node scripts/gen-assets.mjs",
     "install:browsers": "npx playwright install chromium"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",
+    "@huggingface/transformers": "^4.2.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
@@ -19,6 +21,7 @@
     "playwright": "^1.44.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
+    "sharp": "^0.34.5",
     "uuid": "^9.0.1",
     "ws": "^8.17.0"
   },

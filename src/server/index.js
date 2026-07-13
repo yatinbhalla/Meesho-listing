@@ -9,7 +9,10 @@ import skusRouter from './routes/skus.js';
 import recordRouter from './routes/record.js';
 import settingsRouter from './routes/settings.js';
 import profilesRouter from './routes/profiles.js';
+import generateRouter from './routes/generate.js';
 import { ensureProfilesInit } from './profiles.js';
+import { ensureBackgrounds, BG_DIR } from '../images/backgrounds.js';
+import { GENERATED_DIR } from './routes/generate.js';
 
 const app = express();
 const server = createServer(app);
@@ -55,6 +58,13 @@ app.use('/api/skus',   skusRouter);
 app.use('/api/record', recordRouter);
 app.use('/api/settings', settingsRouter);
 app.use('/api/profiles', profilesRouter);
+app.use('/api', generateRouter);   // GET /api/backgrounds, POST /api/generate
+
+// ─── Static image assets ──────────────────────────────────────────────────────
+// Background plates (built-in studio backdrops) and the ephemeral generated
+// composites are served so the browser can preview them before a run.
+app.use('/assets/backgrounds', express.static(BG_DIR));
+app.use('/generated', express.static(GENERATED_DIR));
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, activeSession }));
 
@@ -64,6 +74,9 @@ const PORT = process.env.PORT || 3001;
 // under the "Yatin Bhalla" profile) BEFORE accepting requests.
 ensureProfilesInit()
   .catch((err) => console.error('Profile init failed:', err.message))
+  // Generate the built-in background plates on first boot (cheap + self-healing).
+  .then(() => ensureBackgrounds())
+  .catch((err) => console.error('Background init failed:', err.message))
   .finally(() => {
     server.listen(PORT, () => {
       console.log(`\n✅  Meesho Lister server running on http://localhost:${PORT}`);

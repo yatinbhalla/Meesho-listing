@@ -14,6 +14,15 @@ export default defineConfig({
         target: 'http://localhost:3001',
         changeOrigin: true,
       },
+      // Background plates + generated composites are served by Express.
+      '/assets': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+      },
+      '/generated': {
+        target: 'http://localhost:3001',
+        changeOrigin: true,
+      },
       '/ws': {
         target: 'ws://localhost:3001',
         ws: true,

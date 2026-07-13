@@ -9,8 +9,9 @@ import { broadcast, getActiveSession, setActiveSession, clearActiveSession } fro
 import { getActiveProfile, pathsDirFor } from '../profiles.js';
 
 const router = express.Router();
-const UPLOADS_DIR = path.resolve('data/uploads');
-const MAX_BATCH   = 50;
+const UPLOADS_DIR   = path.resolve('data/uploads');
+const GENERATED_DIR = path.resolve('data/generated');
+const MAX_BATCH     = 50;
 
 // ─── Hero-image upload (per-listing, ephemeral) ─────────────────────────────────
 const upload = multer({
@@ -83,6 +84,75 @@ router.post('/', upload.array('heroImages', MAX_BATCH), async (req, res) => {
         }
       });
 
+  } catch (err) {
+    clearActiveSession();
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * POST /api/run/generated  (JSON)
+ *   - pathName   : string  — folder name under the active profile's paths/
+ *   - sessionId  : string  — the generation session (data/generated/<sessionId>/)
+ *   - images     : string[] — generated file names to list (one listing each)
+ *   - noSubmit   : boolean  — optional diagnostic (fill but never submit)
+ *
+ * Lists images the user already generated + approved via /api/generate. Reuses
+ * the exact same batch pipeline as uploaded images. Responds 202 immediately.
+ */
+router.post('/generated', async (req, res) => {
+  try {
+    if (getActiveSession()) {
+      return res.status(409).json({ error: `Another session is already active (${getActiveSession()}).` });
+    }
+
+    const { pathName, sessionId, images, noSubmit } = req.body || {};
+    if (!pathName) return res.status(400).json({ error: 'pathName is required.' });
+    if (!sessionId || !/^[0-9a-f-]{36}$/i.test(sessionId)) {
+      return res.status(400).json({ error: 'A valid sessionId is required.' });
+    }
+    if (!Array.isArray(images) || images.length === 0) {
+      return res.status(400).json({ error: 'At least one generated image is required.' });
+    }
+
+    // Resolve the path config under the ACTIVE profile.
+    const profile = getActiveProfile();
+    const pathDir = path.join(path.resolve(pathsDirFor(profile.id)), pathName);
+    let pathConfig;
+    try {
+      pathConfig = JSON.parse(await fs.readFile(path.join(pathDir, 'config.json'), 'utf8'));
+    } catch {
+      return res.status(404).json({ error: `Path "${pathName}" not found.` });
+    }
+
+    // Resolve + validate every generated file (guard against path traversal:
+    // names must be plain gen_*.jpg and stay inside the session dir).
+    const sessionDir = path.join(GENERATED_DIR, sessionId);
+    const files = [];
+    for (const name of images) {
+      if (typeof name !== 'string' || !/^gen_[\w.-]+\.jpe?g$/i.test(name)) {
+        return res.status(400).json({ error: `Invalid image name "${name}".` });
+      }
+      const full = path.join(sessionDir, name);
+      if (path.dirname(full) !== sessionDir) {
+        return res.status(400).json({ error: `Invalid image path for "${name}".` });
+      }
+      try { await fs.access(full); }
+      catch { return res.status(404).json({ error: `Generated image "${name}" no longer exists — regenerate.` }); }
+      files.push({ path: full, originalname: name });
+    }
+
+    setActiveSession('running');
+    res.status(202).json({ ok: true, message: `Batch of ${files.length} listing(s) started.` });
+
+    const noSub = noSubmit === true || noSubmit === 'true';
+    runBatch({ pathConfig, pathDir, files, noSubmit: noSub, profile })
+      .catch((err) => broadcast({ type: 'error', topic: 'run', text: err.message }))
+      .finally(() => {
+        clearActiveSession();
+        // Generated composites are per-batch — drop the whole session dir.
+        fs.rm(sessionDir, { recursive: true, force: true }).catch(() => {});
+      });
   } catch (err) {
     clearActiveSession();
     res.status(500).json({ error: err.message });

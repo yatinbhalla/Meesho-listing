@@ -1,21 +1,34 @@
 import React, { useState, useEffect, useRef } from 'react';
 import LiveLog from './LiveLog.jsx';
+import BackgroundStudio from './BackgroundStudio.jsx';
 import { useWS } from '../App.jsx';
 
-// Daily-use screen: pick a path → upload N hero images → click Run.
-// Each image becomes its own listing; everything else (description, AI text,
-// shared images 2-4) is reused across the batch.
+// Daily-use screen. Two ways to supply the per-listing images:
+//   • Upload   — pick N hero images; each becomes its own listing (original flow).
+//   • Generate — upload ONE photo, pick studio backgrounds; the product is cut
+//                out and composited onto each, one listing per background.
+// Both converge on the same batch run; everything else (shared images 2-4, AI
+// text, SKUs) is reused across the batch.
 export default function ListingForm({ path, onRefresh, onEdit, activeProfileName }) {
-  const [heroFiles, setHeroFiles]   = useState([]);     // File[]
-  const [previews, setPreviews]     = useState([]);     // dataURL[]
+  const [mode, setMode]             = useState('upload');   // 'upload' | 'generate'
+  const [heroFiles, setHeroFiles]   = useState([]);         // File[] (upload mode)
+  const [previews, setPreviews]     = useState([]);         // dataURL[] (upload mode)
+  const [generated, setGenerated]   = useState(null);       // { sessionId, images } (generate mode)
   const [running, setRunning]       = useState(false);
-  const [batchStatus, setBatchStatus] = useState(null); // { current, total, sku } | null
+  const [batchStatus, setBatchStatus] = useState(null);     // { current, total, sku } | null
   const [completedSkus, setCompletedSkus] = useState([]);
-  const [failedAt, setFailedAt]     = useState(null);   // { index, sku, error } | null
+  const [failedAt, setFailedAt]     = useState(null);       // { index, sku, error } | null
   const ws = useWS();
 
   // Track only NEW messages so we don't reprocess on every render.
   const lastSeenIndex = useRef(0);
+
+  // Reset per-path state when the user switches paths.
+  useEffect(() => {
+    setMode('upload');
+    setHeroFiles([]); setPreviews([]); setGenerated(null);
+    setCompletedSkus([]); setFailedAt(null); setBatchStatus(null);
+  }, [path?._folder]);
 
   // React to fresh WS messages.
   useEffect(() => {
@@ -38,11 +51,13 @@ export default function ListingForm({ path, onRefresh, onEdit, activeProfileName
         case 'batch_complete':
           setRunning(false);
           setBatchStatus(null);
+          setGenerated(null);   // generated composites are consumed + cleaned server-side
           break;
         case 'batch_failed':
           setRunning(false);
           setBatchStatus(null);
           setFailedAt({ index: msg.index, sku: msg.sku, error: msg.error });
+          setGenerated(null);   // session dir is cleaned up after the batch ends
           break;
       }
     }
@@ -68,11 +83,9 @@ export default function ListingForm({ path, onRefresh, onEdit, activeProfileName
     const newFiles = Array.from(e.target.files || []);
     if (newFiles.length === 0) return;
 
-    // Accumulate so the user can pick from multiple folders.
     const allFiles = [...heroFiles, ...newFiles];
     setHeroFiles(allFiles);
 
-    // Build previews for the newly added files only, then merge.
     Promise.all(
       newFiles.map(
         (f) => new Promise((resolve) => {
@@ -85,9 +98,7 @@ export default function ListingForm({ path, onRefresh, onEdit, activeProfileName
       setPreviews((prev) => [...prev, ...newPreviews]);
     });
 
-    // Reset the input so picking the same file again still triggers onChange.
     e.target.value = '';
-
     setCompletedSkus([]);
     setFailedAt(null);
   }
@@ -127,7 +138,39 @@ export default function ListingForm({ path, onRefresh, onEdit, activeProfileName
     }
   }
 
-  const count = heroFiles.length;
+  async function onRunGenerated() {
+    if (!generated?.images?.length) return;
+    setRunning(true);
+    setCompletedSkus([]);
+    setFailedAt(null);
+    ws.clear();
+
+    try {
+      const res = await fetch('/api/run/generated', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          pathName: path._folder,
+          sessionId: generated.sessionId,
+          images: generated.images.map((i) => i.name),
+        }),
+      });
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        throw new Error(err.error || `Run failed (${res.status})`);
+      }
+    } catch (err) {
+      setRunning(false);
+      alert(err.message);
+    }
+  }
+
+  // What the Run button acts on depends on mode.
+  const runItems = mode === 'upload'
+    ? previews
+    : (generated?.images.map((i) => i.url) || []);
+  const count = runItems.length;
+  const doRun = mode === 'upload' ? onRun : onRunGenerated;
 
   return (
     <div className="max-w-3xl mx-auto p-6 space-y-6">
@@ -164,65 +207,94 @@ export default function ListingForm({ path, onRefresh, onEdit, activeProfileName
         </div>
       )}
 
-      {/* Hero images — multi-file upload */}
-      <div className="bg-white rounded-xl border border-gray-200 p-6">
-        <div className="flex items-center justify-between mb-3">
-          <div>
-            <h3 className="font-semibold">Hero Images</h3>
-            <p className="text-xs text-gray-500 mt-0.5">
-              One listing per image. All listings reuse this path's shared images 2-4.
-            </p>
-          </div>
-          {count > 0 && (
-            <button onClick={clearAll} className="text-sm text-red-600 hover:bg-red-50 px-3 py-1 rounded transition-colors">
-              Clear all
-            </button>
-          )}
+      {/* Mode toggle */}
+      {!running && (
+        <div className="flex gap-2 bg-gray-100 p-1 rounded-xl">
+          <button
+            onClick={() => setMode('upload')}
+            className={`flex-1 py-2 rounded-lg text-sm font-semibold transition-colors
+              ${mode === 'upload' ? 'bg-white shadow text-meesho-dark' : 'text-gray-500 hover:text-gray-700'}`}
+          >
+            📸 Upload images
+          </button>
+          <button
+            onClick={() => setMode('generate')}
+            className={`flex-1 py-2 rounded-lg text-sm font-semibold transition-colors
+              ${mode === 'generate' ? 'bg-white shadow text-meesho-dark' : 'text-gray-500 hover:text-gray-700'}`}
+          >
+            🎨 Change background (1 photo)
+          </button>
         </div>
+      )}
 
-        <label className="block border-2 border-dashed border-gray-300 rounded-lg p-6 text-center cursor-pointer hover:border-meesho-pink hover:bg-pink-50 transition mb-4">
-          <input type="file" accept="image/*" multiple onChange={onFilePick} className="hidden" />
-          <p className="text-3xl mb-2">📸</p>
-          <p className="text-sm font-medium text-gray-700">
-            {count === 0 ? 'Click to choose hero images' : 'Click to add more images'}
-          </p>
-          <p className="text-xs text-gray-400 mt-1">JPG, PNG, or WebP · max 10 MB each · up to 50</p>
-        </label>
-
-        {count > 0 && (
-          <div>
-            <p className="text-xs text-gray-500 mb-2">
-              {count} listing{count === 1 ? '' : 's'} queued
-            </p>
-            <div className="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-6 gap-3">
-              {previews.map((src, i) => {
-                const isDone   = batchStatus && i < batchStatus.current - 1;
-                const isActive = batchStatus && i === batchStatus.current - 1;
-                const isFailed = failedAt && i === failedAt.index - 1;
-                return (
-                  <div key={i} className={`relative rounded border-2 overflow-hidden
-                      ${isFailed ? 'border-red-500' :
-                        isActive ? 'border-meesho-pink ring-2 ring-pink-200' :
-                        isDone   ? 'border-green-500' :
-                                   'border-gray-200'}`}>
-                    <img src={src} alt={`hero ${i+1}`} className="w-full h-24 object-cover" />
-                    {!running && (
-                      <button
-                        onClick={() => removeAt(i)}
-                        className="absolute top-1 right-1 w-5 h-5 bg-white/90 rounded-full text-gray-700 hover:bg-red-500 hover:text-white text-xs leading-none"
-                        title="Remove"
-                      >×</button>
-                    )}
-                    <span className="absolute bottom-1 left-1 px-1.5 py-0.5 bg-black/60 text-white text-[10px] rounded">
-                      {i + 1}{isDone ? ' ✓' : isActive ? ' …' : isFailed ? ' ✗' : ''}
-                    </span>
-                  </div>
-                );
-              })}
+      {/* ─── UPLOAD MODE ─────────────────────────────────────────────────── */}
+      {mode === 'upload' && (
+        <div className="bg-white rounded-xl border border-gray-200 p-6">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="font-semibold">Hero Images</h3>
+              <p className="text-xs text-gray-500 mt-0.5">
+                One listing per image. All listings reuse this path's shared images 2-4.
+              </p>
             </div>
+            {previews.length > 0 && !running && (
+              <button onClick={clearAll} className="text-sm text-red-600 hover:bg-red-50 px-3 py-1 rounded transition-colors">
+                Clear all
+              </button>
+            )}
           </div>
-        )}
-      </div>
+
+          {!running && (
+            <label className="block border-2 border-dashed border-gray-300 rounded-lg p-6 text-center cursor-pointer hover:border-meesho-pink hover:bg-pink-50 transition mb-4">
+              <input type="file" accept="image/*" multiple onChange={onFilePick} className="hidden" />
+              <p className="text-3xl mb-2">📸</p>
+              <p className="text-sm font-medium text-gray-700">
+                {previews.length === 0 ? 'Click to choose hero images' : 'Click to add more images'}
+              </p>
+              <p className="text-xs text-gray-400 mt-1">JPG, PNG, or WebP · max 10 MB each · up to 50</p>
+            </label>
+          )}
+
+          <PreviewGrid
+            items={previews}
+            batchStatus={batchStatus}
+            failedAt={failedAt}
+            onRemove={!running ? removeAt : null}
+          />
+        </div>
+      )}
+
+      {/* ─── GENERATE MODE ───────────────────────────────────────────────── */}
+      {mode === 'generate' && !generated && !running && (
+        <BackgroundStudio onGenerated={setGenerated} disabled={running} />
+      )}
+
+      {mode === 'generate' && generated && (
+        <div className="bg-white rounded-xl border border-gray-200 p-6">
+          <div className="flex items-center justify-between mb-3">
+            <div>
+              <h3 className="font-semibold">Review generated images</h3>
+              <p className="text-xs text-gray-500 mt-0.5">
+                {generated.images.length} image{generated.images.length === 1 ? '' : 's'} · one listing each. Happy with them? Run below.
+              </p>
+            </div>
+            {!running && (
+              <button
+                onClick={() => setGenerated(null)}
+                className="text-sm text-gray-600 hover:bg-gray-100 px-3 py-1 rounded transition-colors border border-gray-300"
+              >
+                ↺ Start over
+              </button>
+            )}
+          </div>
+          <PreviewGrid
+            items={generated.images.map((i) => i.url)}
+            batchStatus={batchStatus}
+            failedAt={failedAt}
+            onRemove={null}
+          />
+        </div>
+      )}
 
       {activeProfileName && (
         <p className="text-center text-sm text-gray-500 mb-2">
@@ -230,24 +302,27 @@ export default function ListingForm({ path, onRefresh, onEdit, activeProfileName
         </p>
       )}
 
-      <button
-        onClick={onRun}
-        disabled={count === 0 || running || blocking}
-        className="w-full py-4 bg-meesho-pink text-white rounded-xl font-bold text-lg hover:bg-meesho-dark transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed"
-      >
-        {running
-          ? (batchStatus
-              ? `⏳ Listing ${batchStatus.current} of ${batchStatus.total}${batchStatus.sku ? ` · ${batchStatus.sku}` : ''}`
-              : '⏳ Starting...')
-          : `🚀 Run for ${count} listing${count === 1 ? '' : 's'}`}
-      </button>
+      {/* Run — hidden in generate mode until images have been generated. */}
+      {!(mode === 'generate' && !generated) && (
+        <button
+          onClick={doRun}
+          disabled={count === 0 || running || blocking}
+          className="w-full py-4 bg-meesho-pink text-white rounded-xl font-bold text-lg hover:bg-meesho-dark transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed"
+        >
+          {running
+            ? (batchStatus
+                ? `⏳ Listing ${batchStatus.current} of ${batchStatus.total}${batchStatus.sku ? ` · ${batchStatus.sku}` : ''}`
+                : '⏳ Starting...')
+            : `🚀 Run for ${count} listing${count === 1 ? '' : 's'}`}
+        </button>
+      )}
 
       {failedAt && (
         <div className="bg-red-50 border border-red-200 text-red-900 rounded-lg p-4">
           <p className="font-semibold">✗ Batch halted at listing {failedAt.index}</p>
           {failedAt.sku && <p className="text-sm mt-1">SKU: <code className="bg-white px-1.5 py-0.5 rounded">{failedAt.sku}</code></p>}
           <p className="text-sm mt-2">{failedAt.error}</p>
-          <p className="text-xs text-red-700 mt-2">Fix the issue (use the recovery overlay if a selector broke), remove already-completed images, and run again.</p>
+          <p className="text-xs text-red-700 mt-2">Fix the issue (use the recovery overlay if a selector broke), then run again.</p>
         </div>
       )}
 
@@ -261,6 +336,46 @@ export default function ListingForm({ path, onRefresh, onEdit, activeProfileName
       )}
 
       <LiveLog topic="run" emptyText="Click Run to start the batch automation." />
+    </div>
+  );
+}
+
+// Shared thumbnail grid with per-item batch-progress decoration. `items` is an
+// array of image srcs (dataURLs or URLs). `onRemove(idx)` enables a remove ✕ per
+// tile when provided.
+function PreviewGrid({ items, batchStatus, failedAt, onRemove }) {
+  if (items.length === 0) return null;
+  return (
+    <div>
+      <p className="text-xs text-gray-500 mb-2">
+        {items.length} listing{items.length === 1 ? '' : 's'} queued
+      </p>
+      <div className="grid grid-cols-4 sm:grid-cols-5 md:grid-cols-6 gap-3">
+        {items.map((src, i) => {
+          const isDone   = batchStatus && i < batchStatus.current - 1;
+          const isActive = batchStatus && i === batchStatus.current - 1;
+          const isFailed = failedAt && i === failedAt.index - 1;
+          return (
+            <div key={i} className={`relative rounded border-2 overflow-hidden
+                ${isFailed ? 'border-red-500' :
+                  isActive ? 'border-meesho-pink ring-2 ring-pink-200' :
+                  isDone   ? 'border-green-500' :
+                             'border-gray-200'}`}>
+              <img src={src} alt={`listing ${i + 1}`} className="w-full h-24 object-cover" />
+              {onRemove && (
+                <button
+                  onClick={() => onRemove(i)}
+                  className="absolute top-1 right-1 w-5 h-5 bg-white/90 rounded-full text-gray-700 hover:bg-red-500 hover:text-white text-xs leading-none"
+                  title="Remove"
+                >×</button>
+              )}
+              <span className="absolute bottom-1 left-1 px-1.5 py-0.5 bg-black/60 text-white text-[10px] rounded">
+                {i + 1}{isDone ? ' ✓' : isActive ? ' …' : isFailed ? ' ✗' : ''}
+              </span>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
