@@ -328,6 +328,24 @@ async function executeStep(step, ctx) {
       return;
     }
 
+    // Optional confirmation clicks (e.g. the post-submit "Update Changes" /
+    // "Proceed" dialog that some catalog forms show and others submit without —
+    // place-mat listings finalize right after the declaration checkbox, wall
+    // hangings show the extra dialog). waitForReady already waited up to
+    // READY_TIMEOUT_MS for the selector; if it's STILL not visible, this form
+    // doesn't use it, so skip cleanly instead of retry → AI nav → manual recovery
+    // (which otherwise hangs the run AFTER an already-successful submit). Same
+    // rule as checkboxes: present → click it; absent → skip it.
+    if (step.optional) {
+      const present = step.selector
+        ? await page.locator(step.selector).first().isVisible().catch(() => false)
+        : false;
+      if (!present) {
+        ctx.log('info', `↪ ${step.label}: optional step not shown this time — skipping.`);
+        return;
+      }
+    }
+
     // Skip clicks on file inputs — they're usually hidden behind a styled
     // button, so clicking fails ("element not visible"). The upload is handled
     // by the subsequent fill step (setInputFiles works on hidden inputs).
