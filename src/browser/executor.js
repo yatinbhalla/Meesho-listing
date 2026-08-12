@@ -751,6 +751,83 @@ async function selectDropdownOption(page, optionText, controlSelector, log) {
       return true;
     }
   } catch { /* fall through */ }
+
+  // 4. Virtualized-list case (the hard one): Meesho's dimension dropdown renders
+  //    options as <p> in a list that shows only ~15 at a time, sorted as STRINGS.
+  //    So "5" sits far down, and a search for "5" also surfaces "0.5","1.5","15",…
+  //    — the exact "5" is never in the rendered window, so steps 2–3 miss it and
+  //    the caller's fallback clicks the wrong one ("0.5"). Scroll the list and
+  //    click the option whose whole text is EXACTLY the value — never a substring.
+  if (await clickExactVirtualizedOption(page, optionText, log)) return true;
+
+  return false;
+}
+
+/**
+ * Click an option whose text is EXACTLY `want` inside an open popover/menu whose
+ * option list is virtualized (only a slice rendered at a time). Scrolls the list
+ * step by step, re-scanning the rendered <p>/<li>/option leaves for an exact
+ * text match, then clicks its nearest clickable ancestor. Never matches a
+ * substring, so "5" can't select "0.5"/"1.5"/"15".
+ */
+async function clickExactVirtualizedOption(page, want, log) {
+  const target = String(want).replace(/\s+/g, ' ').trim();
+  let lastTop = -1;
+  for (let i = 0; i < 40; i++) {
+    const found = await page.evaluate((wanted) => {
+      const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      const papers = Array.from(document.querySelectorAll(
+        '.MuiPopover-paper, .MuiMenu-paper, .MuiAutocomplete-popper, [role="listbox"], ul[role="menu"], .MuiList-root',
+      )).filter(vis);
+      for (const p of papers) {
+        const leaves = Array.from(p.querySelectorAll('p, li, [role="option"], [role="menuitem"]'))
+          .filter((el) => vis(el) && (el.textContent || '').replace(/\s+/g, ' ').trim() === wanted);
+        if (leaves.length) {
+          const hit = leaves[0];
+          const clickable = hit.closest('li, [role="option"], [role="menuitem"]') || hit;
+          document.querySelectorAll('[data-meesho-opt]').forEach((e) => e.removeAttribute('data-meesho-opt'));
+          clickable.setAttribute('data-meesho-opt', '1');
+          return true;
+        }
+      }
+      return false;
+    }, target).catch(() => false);
+
+    if (found) {
+      const loc = page.locator('[data-meesho-opt="1"]').first();
+      try {
+        await loc.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => {});
+        await loc.click({ timeout: 4000 });
+        await page.evaluate(() => document.querySelectorAll('[data-meesho-opt]').forEach((e) => e.removeAttribute('data-meesho-opt'))).catch(() => {});
+        log && log('info', `  ✓ selected option "${truncate(target, 20)}" (scrolled virtualized list).`);
+        return true;
+      } catch { /* keep scrolling */ }
+    }
+
+    // Scroll the list down one page and retry; stop if we've hit the bottom.
+    // Find the element that is ACTUALLY scrollable (biggest scrollHeight-overflow)
+    // anywhere inside an open popover — the overflow lives on the MuiPaper, not
+    // always the <ul>, so we can't assume a fixed container selector.
+    const top = await page.evaluate(() => {
+      const vis = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+      const papers = Array.from(document.querySelectorAll(
+        '.MuiPopover-paper, .MuiMenu-paper, .MuiAutocomplete-popper, [role="listbox"], .MuiList-root, ul[role="menu"]',
+      )).filter(vis);
+      let best = null, bestOver = 8;
+      for (const p of papers) {
+        for (const el of [p, ...p.querySelectorAll('*')]) {
+          const over = el.scrollHeight - el.clientHeight;
+          if (over > bestOver && vis(el)) { bestOver = over; best = el; }
+        }
+      }
+      if (!best) return -1;
+      best.scrollTop = Math.min(best.scrollTop + best.clientHeight * 0.85, best.scrollHeight);
+      return best.scrollTop;
+    }).catch(() => -1);
+    await page.waitForTimeout(140);
+    if (top === -1 || top === lastTop) break;   // no scroller, or reached bottom
+    lastTop = top;
+  }
   return false;
 }
 

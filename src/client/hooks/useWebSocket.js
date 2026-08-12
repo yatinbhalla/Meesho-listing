@@ -26,14 +26,20 @@ export function useWebSocket(onMessage) {
   cbRef.current = onMessage;
 
   function connect() {
-    teardownRef.current = false;
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const ws = new WebSocket(`${protocol}://${window.location.host}/ws`);
     wsRef.current = ws;
 
-    ws.onopen = () => setStatus('connected');
+    ws.onopen = () => {
+      // Ignore a late open on a socket we've already replaced (StrictMode).
+      if (wsRef.current !== ws) { ws.close(); return; }
+      setStatus('connected');
+    };
 
     ws.onmessage = (event) => {
+      // Drop messages from a stale socket that hasn't finished closing yet —
+      // otherwise every broadcast would be processed once per live socket.
+      if (wsRef.current !== ws) return;
       let data;
       try { data = JSON.parse(event.data); } catch { return; }
       const time = new Date().toLocaleTimeString('en-IN', { hour12: false });
@@ -43,22 +49,28 @@ export function useWebSocket(onMessage) {
     };
 
     ws.onclose = () => {
+      // Only the CURRENT socket may schedule a reconnect. StrictMode's
+      // mount→cleanup→mount cycle (and any reconnect) leaves an earlier socket
+      // whose async onclose fires LATER — after connect() has already installed
+      // a new socket. Without this identity check, that stale close schedules
+      // its OWN reconnect, so you end up with several live sockets that each
+      // receive every broadcast — doubling/tripling every log line and SKU.
+      if (wsRef.current !== ws) return;
       setStatus('disconnected');
-      // If the effect cleanup closed us, do NOT schedule a reconnect.
-      // Otherwise the next StrictMode mount opens a fresh socket AND the
-      // reconnect timer also fires → two live sockets, every message double.
       if (teardownRef.current) return;
       clearTimeout(reconnectTimer.current);
       reconnectTimer.current = setTimeout(connect, RECONNECT_DELAY_MS);
     };
 
     ws.onerror = () => {
+      if (wsRef.current !== ws) return;
       setStatus('error');
       ws.close();
     };
   }
 
   useEffect(() => {
+    teardownRef.current = false;
     connect();
     return () => {
       teardownRef.current = true;
