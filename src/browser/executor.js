@@ -315,8 +315,17 @@ async function executeStep(step, ctx) {
     // from the label sentence), so we resolve by the checkbox's TEXT instead.
     if (step.kind === 'checkbox') {
       const cbText = step.checkboxText || cleanCheckboxText(step.label);
-      const ok = await clickCheckboxByText(page, cbText, ctx.log);
-      if (ok) return;
+      if (await clickCheckboxByText(page, cbText, ctx.log)) return;
+
+      // Not on the page (yet). The usual reason is that the PRECEDING click was
+      // supposed to open the dialog this checkbox lives in and didn't — the size
+      // dialog's opener is recorded as a MUI auto-id (#mui-18) that goes stale
+      // on every listing after the first in a batch. Re-open and retry once
+      // before concluding the checkbox isn't being asked for.
+      if (await reopenPrecedingDialog(ctx)) {
+        if (await clickCheckboxByText(page, cbText, ctx.log)) return;
+      }
+
       // OPTIONAL by design: some checkboxes only appear CONDITIONALLY — most
       // notably the post-submit "I understand… not branded/illegal" declaration,
       // which Meesho shows only for certain catalog content. clickCheckboxByText
@@ -327,6 +336,12 @@ async function executeStep(step, ctx) {
       ctx.log('info', `☐ Checkbox "${truncate(cbText, 50)}" not shown this time — skipping (optional).`);
       return;
     }
+
+    // MUI auto-ids drift between listings in a batch — re-find the control by
+    // position before anything else looks at step.selector. Local copy only:
+    // the resolved handle is valid for this click, never for the config on disk.
+    const muiClickSel = await resolveMuiAutoId(page, step.selector, step.label, ctx.log);
+    if (muiClickSel) step = { ...step, selector: muiClickSel };
 
     // Optional confirmation clicks (e.g. the post-submit "Update Changes" /
     // "Proceed" dialog that some catalog forms show and others submit without —
@@ -427,7 +442,10 @@ async function executeStep(step, ctx) {
   }
   if (step.action === 'fill') {
     const field = resolveFillField(step, ctx);
-    await fillField(page, field, ctx);
+    // Same MUI auto-id drift as on clicks (the size selector is filled with
+    // "Free Size" right after the dialog's Apply).
+    const muiFillSel = await resolveMuiAutoId(page, field.selector, field.fieldName, ctx.log);
+    await fillField(page, muiFillSel ? { ...field, selector: muiFillSel } : field, ctx);
     if (field.type === 'image') ctx.imageSlot++;
     return;
   }
@@ -521,12 +539,19 @@ async function waitForReady(page, step, log) {
   // (~5s × 100+ steps ≈ 9 wasted minutes). The real readiness signal is the
   // next step's target element being attached, which we wait for below.
 
-  if (step.selector && step.action !== 'navigate') {
+  // Checkbox steps are resolved by their visible TEXT, never by the recorded
+  // selector (typically a positional path like "body > div:nth-of-type(4) > div").
+  // Waiting READY_TIMEOUT_MS on it is dead time when the dialog didn't open, and
+  // actively misleading when it "succeeds" by matching an unrelated 4th div.
+  if (step.selector && step.action !== 'navigate' && step.kind !== 'checkbox') {
     // Option-style selectors (text="…") belong to a dropdown that often isn't
     // open yet — the click handler auto-opens it. Don't burn the full 15s here;
     // a short wait is enough, then let the click's open-preflight take over.
+    // MUI auto-ids are known-unstable (see resolveMuiAutoId) — a missing one is
+    // the expected case, not a slow render, so don't burn the full timeout on it
+    // before the click re-resolves the control by position.
     const isOption = /^text=/.test(step.selector);
-    const timeout = isOption ? 2500 : READY_TIMEOUT_MS;
+    const timeout = isOption || MUI_AUTO_ID_RE.test(step.selector) ? 2500 : READY_TIMEOUT_MS;
     try {
       await page.waitForSelector(step.selector, { state: 'attached', timeout });
     } catch {
@@ -574,6 +599,94 @@ async function firstVisible(page, selector, preferText) {
   return visibles[0];
 }
 
+// MUI auto-generated ids (#mui-18) are NOT stable. MUI hands them out from a
+// counter that keeps incrementing for as long as the SPA stays mounted, so a
+// recorded #mui-18 only matches on the FIRST catalog form after a page load. In
+// a batch run every listing shares one browser page (see run.js), which makes
+// the same control #mui-45 on the second listing, #mui-72 on the third… In this
+// flow that id belongs to the SIZE selector — when it goes stale the size dialog
+// never opens, and the "Free Size" checkbox inside it is nowhere on the page.
+const MUI_AUTO_ID_RE = /^#mui-\d+$/;
+
+/**
+ * Re-find a control that was recorded under a MUI auto-id.
+ *
+ * Returns a selector usable RIGHT NOW ('[data-meesho-mui="1"]'), or null when
+ * the recorded id still resolves (nothing to do) or nothing plausible is on the
+ * page. Deliberately NOT persisted: the number is different on every run, so
+ * writing one back would just bake in another stale id.
+ */
+async function resolveMuiAutoId(page, selector, label, log, { force = false } = {}) {
+  const recorded = String(selector || '').trim();
+  if (!MUI_AUTO_ID_RE.test(recorded)) return null;
+
+  // When the recorded id still resolves we normally leave it alone. `force`
+  // overrides that: the counter can just as easily have handed #mui-18 to a
+  // DIFFERENT control, in which case the click "succeeds" on the wrong element
+  // and nothing opens. Callers that already know the click had no effect pass
+  // force:true so we re-resolve by position and skip the recorded id.
+  if (!force) {
+    const stillThere = await page.locator(recorded).first().isVisible().catch(() => false);
+    if (stillThere) return null;
+  }
+
+  const tagged = await page.evaluate(({ skipId, avoid }) => {
+    document.querySelectorAll('[data-meesho-mui]').forEach((e) => e.removeAttribute('data-meesho-mui'));
+    const visible = (el) => {
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      return r.width > 0 && r.height > 0 && cs.visibility !== 'hidden' && cs.display !== 'none';
+    };
+    // Controls MUI had to number because the markup gave them no real id. Every
+    // OTHER field on Meesho's catalog form has a semantic id (#color, #material,
+    // #hsn_code, …), so on a rendered form this set is tiny — usually just the
+    // size selector.
+    const cands = Array.from(document.querySelectorAll(
+      'input[id^="mui-"], [id^="mui-"][role="combobox"], [id^="mui-"][role="button"]',
+    )).filter(visible).filter((el) => !(avoid && el.id === skipId));
+    if (!cands.length) return false;
+    // Prefer one sitting under a "Size" label; otherwise take the only/first.
+    const rowText = (el) => {
+      let n = el;
+      for (let i = 0; i < 4 && n.parentElement; i++) n = n.parentElement;
+      return (n.textContent || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    };
+    (cands.find((el) => /\bsize\b/.test(rowText(el))) || cands[0])
+      .setAttribute('data-meesho-mui', '1');
+    return true;
+  }, { skipId: recorded.slice(1), avoid: force }).catch(() => false);
+
+  if (!tagged) return null;
+  log && log('info', `  ↪ ${recorded} is a MUI auto-id and has drifted (batch re-render) — re-resolved "${truncate(label || recorded, 40)}" by position.`);
+  return '[data-meesho-mui="1"]';
+}
+
+/**
+ * Re-run the click that was supposed to open the dialog the current checkbox
+ * lives in. Used when the checkbox text isn't on the page: far better to reopen
+ * the dialog than to skip a REQUIRED checkbox (skipping "Free Size" leaves the
+ * next step, the dialog's "Apply" button, unclickable — which is what actually
+ * stalls the run into the 5-minute manual-recovery pause).
+ *
+ * Returns true if it clicked something.
+ */
+async function reopenPrecedingDialog(ctx) {
+  const prev = (ctx.pathConfig.steps || [])[(ctx.currentStepIndex ?? 0) - 1];
+  if (!prev || prev.action !== 'click' || !prev.selector || prev.kind === 'checkbox') return false;
+
+  // force:true — we already know the recorded click did NOT open the dialog, so
+  // the recorded id is wrong even if it still matches something on the page.
+  const sel = (await resolveMuiAutoId(ctx.page, prev.selector, prev.label, ctx.log, { force: true }))
+    || prev.selector;
+  const loc = ctx.page.locator(sel).first();
+  if (!(await loc.isVisible().catch(() => false))) return false;
+
+  ctx.log('info', `  ↻ checkbox not on the page — re-clicking "${truncate(prev.label || sel, 40)}" to open its dialog.`);
+  await loc.click({ timeout: 5000 }).catch(() => {});
+  await ctx.page.waitForTimeout(800);
+  return true;
+}
+
 /**
  * Click a CUSTOM checkbox identified by its visible text — robustly.
  *
@@ -600,19 +713,35 @@ async function clickCheckboxByText(page, text, log) {
     .waitFor({ state: 'visible', timeout: 4000 }).catch(() => {});
 
   // Tag the checkbox element (browser side) so Playwright can click it.
-  const found = await page.evaluate((wanted) => {
+  const scan = page.evaluate((wanted) => {
     const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
     const w = wanted.toLowerCase();
     document.querySelectorAll('[data-meesho-cb]').forEach((e) => e.removeAttribute('data-meesho-cb'));
 
     // Find the smallest VISIBLE element whose text matches (exact, else contains).
-    const all = Array.from(document.querySelectorAll('body *'));
+    //
+    // PERF/HANG: the previous version called innerText on EVERY element in the
+    // page. innerText forces a layout pass and builds the whole rendered-text
+    // string of each subtree, and on a MISS (the dialog never opened) it walked
+    // the entire DOM three times over — inside a page.evaluate, which Playwright
+    // does not time out. A missing checkbox therefore read as a frozen run.
+    // Prefilter on textContent (no layout, no subtree strings) and only test
+    // visibility on the handful of nodes that actually contain the text.
+    const cands = [];
+    for (const el of document.querySelectorAll('body *')) {
+      if (el.children.length > 2) continue;               // not a leaf-ish text node
+      const t = norm(el.textContent).toLowerCase();
+      if (!t || !t.includes(w)) continue;
+      cands.push({ el, exact: t === w, leaf: el.children.length === 0, len: t.length });
+      if (cands.length >= 200) break;                     // hard cap — never scan-bomb
+    }
     const visible = (el) => el.offsetParent !== null || (el.getClientRects && el.getClientRects().length);
-    let textEl =
-      all.find((el) => visible(el) && norm(el.innerText) .toLowerCase() === w && el.children.length === 0) ||
-      all.find((el) => visible(el) && norm(el.textContent).toLowerCase() === w && el.children.length <= 1) ||
-      all.find((el) => visible(el) && norm(el.textContent).toLowerCase().includes(w) && el.children.length <= 2);
-    if (!textEl) return null;
+    const vis = cands.filter((c) => visible(c.el));
+    if (!vis.length) return null;
+    // Same preference order as before: exact match first, then leaf-most, then
+    // the tightest containing text.
+    vis.sort((a, b) => (b.exact - a.exact) || (b.leaf - a.leaf) || (a.len - b.len));
+    const textEl = vis[0].el;
 
     // 1. A checkbox input in the nearest row ancestor.
     let row = textEl;
@@ -636,6 +765,18 @@ async function clickCheckboxByText(page, text, log) {
     (textEl.parentElement || textEl).setAttribute('data-meesho-cb', '1');
     return 'row';
   }, target).catch(() => null);
+
+  // Belt-and-braces: page.evaluate has no timeout of its own, so a page that
+  // stops servicing the main thread (heavy React commit, a frozen tab) would
+  // block the whole run here with no error. Bound it and treat a stall as a miss.
+  const found = await Promise.race([
+    scan,
+    new Promise((r) => setTimeout(() => r('__TIMEOUT__'), 10_000)),
+  ]);
+  if (found === '__TIMEOUT__') {
+    log && log('info', `  ⌛ checkbox lookup for "${truncate(target, 40)}" timed out — treating as not present.`);
+    return false;
+  }
 
   if (!found) return false;
 
