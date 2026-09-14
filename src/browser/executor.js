@@ -1205,7 +1205,22 @@ async function fillField(page, field, ctx) {
 
   // Target the first VISIBLE match — Meesho's search/text selectors are often
   // shared across many hidden inputs; .first() would grab a hidden one.
-  const loc = await firstVisible(page, field.selector);
+  let loc = await firstVisible(page, field.selector);
+
+  // WHY: Meesho renames input ids along with their labels (#only_wrong_return_price
+  // became the "Wrong / Defective Return Discount" input under a new id). A stale
+  // selector matches nothing, and the editable check below would then skip the
+  // fill silently. Fall back to the input whose visible label matches fieldName.
+  if (field.selector && await page.locator(field.selector).count().catch(() => 0) === 0) {
+    const byLabel = await locateByLabel(page, field.fieldName);
+    if (byLabel) {
+      log('info', `⚠ ${field.selector} is not on the page — filling the input labelled "${field.fieldName}" instead (${byLabel.desc}). Update this path's selector.`);
+      loc = byLabel.locator;
+    } else {
+      log('error', `⚠ ${field.fieldName}: ${field.selector} is not on the page and no input is labelled "${field.fieldName}" — NOT filled. Candidates: ${await describeInputs(page)}`);
+      return;
+    }
+  }
 
   // WHY: Meesho's GST %, HSN code, and similar fields are React-Select style
   // dropdowns. Their underlying <input> (#supplier_gst_percent, #hsn_code) is
@@ -1229,6 +1244,64 @@ async function fillField(page, field, ctx) {
   if (value && String(value).length <= 40) {
     ctx.lastTypedValue = String(value);
   }
+}
+
+/**
+ * Find a visible, editable input by its visible label text. Tries Playwright's
+ * accessible-label match first, then a DOM-proximity scan (label text node →
+ * nearest input in the same small container) for labels not wired via for/aria.
+ * The label match ignores punctuation/spacing ("Wrong/Defective" ≈ "Wrong / Defective").
+ * Returns { locator, desc } or null.
+ */
+async function locateByLabel(page, labelText) {
+  const words = String(labelText || '').match(/[a-z0-9]+/gi) || [];
+  // Recorder-derived names like "meesho_price" are ids, not labels — skip them.
+  if (words.length < 2 || /_/.test(labelText)) return null;
+  const re = new RegExp(words.map((w) => w.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('\\W*'), 'i');
+
+  const describe = (el) => el.evaluate((e) =>
+    e.id ? `#${e.id}` : e.name ? `[name="${e.name}"]` : e.tagName.toLowerCase()).catch(() => '?');
+
+  const byAria = page.getByLabel(re);
+  const n = Math.min(await byAria.count().catch(() => 0), 10);
+  for (let i = 0; i < n; i++) {
+    const el = byAria.nth(i);
+    if (await el.isVisible().catch(() => false) && await el.isEditable().catch(() => false)) {
+      return { locator: el, desc: await describe(el) };
+    }
+  }
+
+  const token = `ml${Date.now()}`;
+  const found = await page.evaluate(({ src, flags, token }) => {
+    const rx = new RegExp(src, flags);
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    for (let t = walker.nextNode(); t; t = walker.nextNode()) {
+      if (!rx.test(t.textContent || '')) continue;
+      let box = t.parentElement;
+      for (let up = 0; box && up < 5; up++, box = box.parentElement) {
+        const inputs = [...box.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]), textarea')]
+          .filter((e) => e.offsetParent !== null && !e.disabled && !e.readOnly);
+        if (inputs.length === 1) { inputs[0].setAttribute('data-ml-label', token); return true; }
+        if (inputs.length > 1) break;   // ambiguous container — don't guess
+      }
+    }
+    return false;
+  }, { src: re.source, flags: re.flags, token }).catch(() => false);
+  if (!found) return null;
+  const el = page.locator(`[data-ml-label="${token}"]`).first();
+  return { locator: el, desc: await describe(el) };
+}
+
+// Compact list of visible text inputs (id / name / nearby label) for diagnosing
+// a selector that no longer exists on the page.
+async function describeInputs(page) {
+  return page.evaluate(() => [...document.querySelectorAll('input:not([type=hidden]):not([type=checkbox]):not([type=radio]), textarea')]
+    .filter((e) => e.offsetParent !== null)
+    .slice(0, 25)
+    .map((e) => {
+      const lbl = (e.labels && e.labels[0] && e.labels[0].innerText) || e.getAttribute('aria-label') || e.placeholder || '';
+      return `${e.id ? '#' + e.id : e.name ? `[name=${e.name}]` : e.tagName.toLowerCase()}${lbl ? ` "${lbl.trim().slice(0, 40)}"` : ''}`;
+    }).join(' | ')).catch(() => '(unavailable)');
 }
 
 // How long the recovery overlay waits for the user before giving up.
